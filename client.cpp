@@ -80,6 +80,7 @@ static const uint32_t MAGIC_TRIAD_START = 0xBBBBBBBB;
 static const uint32_t MAGIC_STATIC_R    = 0xCCCCCCCC;
 static const uint32_t MAGIC_ADAPTIVE    = 0xDDDDDDDD;
 static const uint32_t MAGIC_ALL_DONE    = 0xEEEEEEEE;
+static const uint32_t MAGIC_ABORT_SR    = 0xCC1EAF01;  // early-abort for Static-R experiment
 
 // ============================================================================
 // Network helpers
@@ -333,10 +334,131 @@ int main(int argc, char* argv[]) {
             sendVec(fd, xi_plain);
         }
 
-        sig = recvU32(fd);
-        if (sig != MAGIC_TRIAD_START)
-            throw runtime_error("Expected MAGIC_TRIAD_START, got: " + to_string(sig));
-        cout << "[PlainADMM] Done. Proceeding to TRIAD..." << endl;
+        // -----------------------------------------------------------------------
+        // Static-R experiments: handle any MAGIC_STATIC_R before MAGIC_TRIAD_START
+        // -----------------------------------------------------------------------
+        while (true) {
+            sig = recvU32(fd);
+            if (sig == MAGIC_TRIAD_START) {
+                cout << "[PlainADMM] Done. Proceeding to TRIAD..." << endl;
+                break;
+            }
+            if (sig != MAGIC_STATIC_R)
+                throw runtime_error("Expected MAGIC_STATIC_R or MAGIC_TRIAD_START");
+
+            double fixedR = recvD(fd);
+            cout << "\n===== StaticR=" << fixed << setprecision(1) << fixedR
+                 << " =====" << endl;
+
+            // Init state — no Bootstrap R, use fixedR directly
+            vector<double> uiS(N_FEAT, 0.0);
+            auto encUiS = cc->Encrypt(jointPK,
+                              cc->MakeCKKSPackedPlaintext(vector<double>(N_FEAT, 0.0)));
+            Ciphertext<DCRTPoly> encXiS = cc->Encrypt(jointPK,
+                              cc->MakeCKKSPackedPlaintext(vector<double>(N_FEAT, 0.0)));
+
+            // ADMM iterations — same as TRIAD Phase 2 but WITHOUT CRC (step e)
+            for (int iter = 0; iter < maxIter; iter++) {
+                cout << "  iter=" << setw(2) << iter
+                     << "  t=" << fixed << setprecision(1) << elapsed() << "s" << endl;
+                cout.flush();
+
+                // a) Send fresh masks
+                vector<double> rvS(N_FEAT), ruS(N_FEAT);
+                for (auto& v : rvS) v = maskDist(rng);
+                for (auto& v : ruS) v = maskDist(rng);
+                auto encRvS = cc->Encrypt(jointPK, cc->MakeCKKSPackedPlaintext(rvS));
+                auto encRuS = cc->Encrypt(jointPK, cc->MakeCKKSPackedPlaintext(ruS));
+                sendObj(fd, encRvS, cc);
+                sendObj(fd, encRuS, cc);
+
+                // b) Phase A: participate in ALL v masked-decrypts
+                vector<double> viS(N_FEAT, 0.0);
+                for (int j = 0; j < NUM_PARTIES; j++) {
+                    auto encVjM = recvObj<Ciphertext<DCRTPoly>>(fd, cc);
+                    Ciphertext<DCRTPoly> partV;
+                    if (myId == 0) partV = cc->MultipartyDecryptLead({encVjM}, mySK)[0];
+                    else           partV = cc->MultipartyDecryptMain({encVjM}, mySK)[0];
+                    sendObj(fd, partV, cc);
+                    if (j == myId) {
+                        auto viM = recvVec(fd);
+                        for (size_t k = 0; k < N_FEAT; k++) viS[k] = viM[k] - rvS[k];
+                    }
+                }
+
+                // c) x-update
+                auto xiS = matvec(Mi, vecadd(gi, vecscale(viS, rho)));
+                encXiS = cc->Encrypt(jointPK, cc->MakeCKKSPackedPlaintext(xiS));
+                sendObj(fd, encXiS, cc);
+
+                // d) Phase C: participate in ALL u masked-decrypts
+                for (int j = 0; j < NUM_PARTIES; j++) {
+                    auto encUjM = recvObj<Ciphertext<DCRTPoly>>(fd, cc);
+                    Ciphertext<DCRTPoly> partU;
+                    if (myId == 0) partU = cc->MultipartyDecryptLead({encUjM}, mySK)[0];
+                    else           partU = cc->MultipartyDecryptMain({encUjM}, mySK)[0];
+                    sendObj(fd, partU, cc);
+                    if (j == myId) {
+                        auto uiM = recvVec(fd);
+                        for (size_t k = 0; k < N_FEAT; k++) uiS[k] = uiM[k] - ruS[k];
+                    }
+                }
+
+                // e) [NO CRC for Static-R]
+
+                // f) Receive enc(z)
+                auto encZnewS = recvObj<Ciphertext<DCRTPoly>>(fd, cc);
+
+                // g) u-update
+                encUiS = cc->EvalAdd(encUiS, cc->EvalSub(encXiS, encZnewS));
+                sendObj(fd, encUiS, cc);
+
+                // h) MAGIC_ABORT_SR (early-abort), MAGIC_REFRESH, or MAGIC_ITERDONE
+                uint32_t flagS = recvU32(fd);
+                if (flagS == MAGIC_ABORT_SR) {
+                    // Server detected explosion/decrypt-fail — exit iteration loop.
+                    // Final-decrypt sequence follows immediately (MAGIC_END + enc(z)).
+                    cout << "  [ABORT_SR] server aborted StaticR=" << fixed
+                         << setprecision(1) << fixedR
+                         << " early — proceeding to final decrypt" << endl;
+                    break;
+                }
+                if (flagS == MAGIC_REFRESH) {
+                    auto encZrefS = recvObj<Ciphertext<DCRTPoly>>(fd, cc);
+                    Ciphertext<DCRTPoly> partZS;
+                    if (myId == 0) partZS = cc->MultipartyDecryptLead({encZrefS}, mySK)[0];
+                    else           partZS = cc->MultipartyDecryptMain({encZrefS}, mySK)[0];
+                    sendObj(fd, partZS, cc);
+                    auto encZfreshS = recvObj<Ciphertext<DCRTPoly>>(fd, cc);
+                    (void)encZfreshS;
+                    encUiS = cc->Encrypt(jointPK, cc->MakeCKKSPackedPlaintext(uiS));
+                    sendObj(fd, encUiS, cc);
+                }
+
+                // i) Side-decrypt for objective monitoring
+                {
+                    auto encZobjS = recvObj<Ciphertext<DCRTPoly>>(fd, cc);
+                    Ciphertext<DCRTPoly> partObjS;
+                    if (myId == 0) partObjS = cc->MultipartyDecryptLead({encZobjS}, mySK)[0];
+                    else           partObjS = cc->MultipartyDecryptMain({encZobjS}, mySK)[0];
+                    sendObj(fd, partObjS, cc);
+                }
+            }
+
+            // Final decrypt for this static-R run
+            if (recvU32(fd) != MAGIC_END)
+                throw runtime_error("Expected MAGIC_END after static-R");
+            auto encZfinalS = recvObj<Ciphertext<DCRTPoly>>(fd, cc);
+            Ciphertext<DCRTPoly> partFinalS;
+            if (myId == 0) partFinalS = cc->MultipartyDecryptLead({encZfinalS}, mySK)[0];
+            else           partFinalS = cc->MultipartyDecryptMain({encZfinalS}, mySK)[0];
+            sendObj(fd, partFinalS, cc);
+            auto zFinalS = recvVec(fd); zFinalS.resize(N_FEAT);
+            cout << "StaticR=" << fixedR << " done. z[0..4]:";
+            for (int i = 0; i < 5; i++)
+                cout << " " << fixed << setprecision(4) << zFinalS[i];
+            cout << "\nt=" << elapsed() << "s" << endl;
+        }  // end static-R loop
     }
 
     // -----------------------------------------------------------------------
