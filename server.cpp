@@ -88,10 +88,15 @@ static const char* CLIENT_IPS[3] = {
     "192.168.249.214"
 };
 
-static const uint32_t MAGIC_READY    = 0xCAFEBABE;
-static const uint32_t MAGIC_REFRESH  = 0xABCD1234;
-static const uint32_t MAGIC_ITERDONE = 0x00000001;
-static const uint32_t MAGIC_END      = 0xFFFFFFFF;
+static const uint32_t MAGIC_READY       = 0xCAFEBABE;
+static const uint32_t MAGIC_REFRESH     = 0xABCD1234;
+static const uint32_t MAGIC_ITERDONE   = 0x00000001;
+static const uint32_t MAGIC_END         = 0xFFFFFFFF;
+static const uint32_t MAGIC_PLAIN_ADMM  = 0xAAAAAAAA;
+static const uint32_t MAGIC_TRIAD_START = 0xBBBBBBBB;
+static const uint32_t MAGIC_STATIC_R    = 0xCCCCCCCC;
+static const uint32_t MAGIC_ADAPTIVE    = 0xDDDDDDDD;
+static const uint32_t MAGIC_ALL_DONE    = 0xEEEEEEEE;
 
 // ============================================================================
 // Network helpers
@@ -136,6 +141,13 @@ static void sendVec(int fd, const vector<double>& v) {
     uint32_t n = htonl((uint32_t)(v.size() * 8));
     sendAll(fd, (char*)&n, 4);
     sendAll(fd, (char*)v.data(), v.size() * 8);
+}
+static vector<double> recvVec(int fd) {
+    uint32_t n; recvAll(fd, (char*)&n, 4);
+    uint32_t bytes = ntohl(n);
+    vector<double> v(bytes / 8);
+    recvAll(fd, (char*)v.data(), bytes);
+    return v;
 }
 static void     sendD  (int fd, double   v) { sendAll(fd, (char*)&v, 8); }
 static double   recvD  (int fd)             { double v; recvAll(fd, (char*)&v, 8); return v; }
@@ -234,6 +246,84 @@ static double computeObjective(const vector<double>& z,
 }
 
 // ============================================================================
+// Matrix algebra helpers (same logic as client.cpp)
+// ============================================================================
+static Mat transpose(const Mat& A) {
+    size_t m = A.size(), n = A[0].size();
+    Mat T(n, vector<double>(m));
+    for (size_t i = 0; i < m; i++)
+        for (size_t j = 0; j < n; j++) T[j][i] = A[i][j];
+    return T;
+}
+static Mat matmul(const Mat& A, const Mat& B) {
+    size_t m = A.size(), k = B.size(), n = B[0].size();
+    Mat C(m, vector<double>(n, 0));
+    for (size_t i = 0; i < m; i++)
+        for (size_t l = 0; l < k; l++)
+            for (size_t j = 0; j < n; j++) C[i][j] += A[i][l] * B[l][j];
+    return C;
+}
+static Mat matadd(const Mat& A, const Mat& B) {
+    size_t m = A.size(), n = A[0].size();
+    Mat C(m, vector<double>(n));
+    for (size_t i = 0; i < m; i++)
+        for (size_t j = 0; j < n; j++) C[i][j] = A[i][j] + B[i][j];
+    return C;
+}
+static Mat eye(size_t n, double s = 1.0) {
+    Mat I(n, vector<double>(n, 0));
+    for (size_t i = 0; i < n; i++) I[i][i] = s;
+    return I;
+}
+static Mat invertSPD(Mat A) {
+    size_t n = A.size();
+    for (size_t i = 0; i < n; i++) A[i][i] += 1e-10;
+    Mat L(n, vector<double>(n, 0));
+    for (size_t i = 0; i < n; i++) {
+        for (size_t j = 0; j <= i; j++) {
+            double s = A[i][j];
+            for (size_t k = 0; k < j; k++) s -= L[i][k] * L[j][k];
+            L[i][j] = (i == j) ? sqrt(max(s, 1e-12)) : s / L[j][j];
+        }
+    }
+    Mat Li(n, vector<double>(n, 0));
+    for (size_t i = 0; i < n; i++) {
+        Li[i][i] = 1.0 / L[i][i];
+        for (size_t j = 0; j < i; j++) {
+            double s = 0;
+            for (size_t k = j; k < i; k++) s -= L[i][k] * Li[k][j];
+            Li[i][j] = s / L[i][i];
+        }
+    }
+    Mat Inv(n, vector<double>(n, 0));
+    for (size_t i = 0; i < n; i++)
+        for (size_t j = 0; j < n; j++)
+            for (size_t k = 0; k < n; k++) Inv[i][j] += Li[k][i] * Li[k][j];
+    return Inv;
+}
+static vector<double> matvec(const Mat& A, const vector<double>& x) {
+    vector<double> y(A.size(), 0);
+    for (size_t i = 0; i < A.size(); i++)
+        for (size_t j = 0; j < x.size(); j++) y[i] += A[i][j] * x[j];
+    return y;
+}
+static vector<double> vecadd(const vector<double>& a, const vector<double>& b) {
+    vector<double> c(a.size()); for (size_t i = 0; i < a.size(); i++) c[i] = a[i]+b[i]; return c;
+}
+static vector<double> vecsub(const vector<double>& a, const vector<double>& b) {
+    vector<double> c(a.size()); for (size_t i = 0; i < a.size(); i++) c[i] = a[i]-b[i]; return c;
+}
+static vector<double> vecscale(const vector<double>& a, double s) {
+    vector<double> c(a.size()); for (size_t i = 0; i < a.size(); i++) c[i] = a[i]*s; return c;
+}
+static vector<double> softThreshVec(const vector<double>& w, double th) {
+    vector<double> z(w.size());
+    for (size_t i = 0; i < w.size(); i++)
+        z[i] = (w[i] > th) ? w[i]-th : (w[i] < -th) ? w[i]+th : 0.0;
+    return z;
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 int main() {
@@ -246,6 +336,8 @@ int main() {
     cout << "=== TRIAD Server (K=" << NUM_PARTIES << ") ===" << endl;
     cout << "  lambda=" << lambda_lasso << " kappa=" << kappa
          << " Lmin=" << Lmin_levels << endl;
+
+    vector<double> zPlain(N_FEAT, 0.0);  // filled by distributed plaintext ADMM below
 
     // -----------------------------------------------------------------------
     // Phase 0: Load keys
@@ -315,10 +407,80 @@ int main() {
     cout << "  All clients ready (t=" << elapsed() << "s)" << endl;
 
     // -----------------------------------------------------------------------
-    // Phase 1: Bootstrap R
+    // Distributed Plaintext ADMM baseline (Pi clients participate via network)
     // -----------------------------------------------------------------------
-    cout << "\n[Phase 1] Bootstrap R..." << endl;
-    vector<Ciphertext<DCRTPoly>> encX0(NUM_PARTIES);
+    cout << "\n[Plaintext ADMM] Starting distributed baseline..." << endl;
+    bcastU32(fds, MAGIC_PLAIN_ADMM);
+
+    {
+        vector<double> zP(N_FEAT, 0.0);
+        vector<vector<double>> uP(NUM_PARTIES, vector<double>(N_FEAT, 0.0));
+
+        ofstream plog("plaintext_admm_log.csv");
+        plog << "iter,objective,elapsed_s\n";
+
+        for (int iter = 0; iter < maxIter; iter++) {
+            // Send v_i = z - u_i to each client
+            for (int i = 0; i < NUM_PARTIES; i++)
+                sendVec(fds[i], vecsub(zP, uP[i]));
+
+            // Receive x_i from each client
+            vector<vector<double>> xP(NUM_PARTIES);
+            for (int i = 0; i < NUM_PARTIES; i++)
+                xP[i] = recvVec(fds[i]);
+
+            // z-update: w = (1/K)*sum(x_i+u_i), z = softThresh(w, kappa)
+            vector<double> w(N_FEAT, 0.0);
+            for (int i = 0; i < NUM_PARTIES; i++)
+                w = vecadd(w, vecadd(xP[i], uP[i]));
+            zP = softThreshVec(vecscale(w, 1.0 / NUM_PARTIES), kappa);
+
+            // u_i update
+            for (int i = 0; i < NUM_PARTIES; i++)
+                uP[i] = vecadd(uP[i], vecsub(xP[i], zP));
+
+            double obj = computeObjective(zP, globalA, globalB);
+            cout << "  [PlainADMM] iter=" << setw(2) << iter
+                 << "  obj=" << fixed << setprecision(6) << obj
+                 << "  t=" << fixed << setprecision(2) << elapsed() << "s" << endl;
+            plog << iter << "," << obj << "," << elapsed() << "\n";
+            plog.flush();
+        }
+        plog.close();
+        zPlain = zP;
+        cout << "[Plaintext ADMM] Done. Final obj="
+             << computeObjective(zPlain, globalA, globalB) << endl;
+    }
+
+    bcastU32(fds, MAGIC_TRIAD_START);
+    cout << "  MAGIC_TRIAD_START sent (t=" << elapsed() << "s)" << endl;
+
+    // -----------------------------------------------------------------------
+    // Multi-experiment: Static-R variants then Adaptive TRIAD
+    // -----------------------------------------------------------------------
+    struct ExpResult { string label; double finalObj; bool exploded; };
+    vector<ExpResult> allResults;
+    allResults.push_back({"Plaintext_ADMM",
+                          computeObjective(zPlain, globalA, globalB), false});
+
+    // ── per-experiment runner ────────────────────────────────────────────────
+    // adaptive=true  → Bootstrap R + CRC (full TRIAD)
+    // adaptive=false → use fixedR throughout, no Bootstrap, no CRC (Static-R)
+    auto runExp = [&](bool adaptive, double fixedR, const string& label) {
+        cout << "\n===== " << label << " =====" << endl;
+
+        auto ptZero = cc->MakeCKKSPackedPlaintext(vector<double>(N_FEAT, 0.0));
+        auto encZ   = cc->Encrypt(jointPK, ptZero);
+        vector<Ciphertext<DCRTPoly>> encU(NUM_PARTIES);
+        for (int i = 0; i < NUM_PARTIES; i++)
+            encU[i] = cc->Encrypt(jointPK, ptZero);
+
+        double currentR = fixedR > 0 ? fixedR : 1.0;
+        auto   coeffs   = chebyCoeffs(currentR, chebyDegree);
+
+        // Phase 1: Bootstrap R (adaptive only)
+        if (adaptive) {
+            vector<Ciphertext<DCRTPoly>> encX0(NUM_PARTIES);
     for (int i = 0; i < NUM_PARTIES; i++)
         encX0[i] = recvObj<Ciphertext<DCRTPoly>>(fds[i], cc);
 
@@ -488,6 +650,23 @@ int main() {
     for (int i = 0; i < 10; i++) cout << " " << fixed << setprecision(4) << zF[i];
     cout << "\nFinal objective: " << computeObjective(zF, globalA, globalB) << endl;
     cout << "Total time: " << elapsed() << "s" << endl;
+
+    // Comparison summary
+    Mat cmpA; vector<double> cmpB;
+    for (int pid = 0; pid < NUM_PARTIES; pid++) {
+        Mat Ai; vector<double> bi; genData(pid, Ai, bi);
+        for (auto& row : Ai) cmpA.push_back(row);
+        for (double v : bi) cmpB.push_back(v);
+    }
+    double objPlain = computeObjective(zPlain, cmpA, cmpB);
+    double objTriad = computeObjective(zF,     cmpA, cmpB);
+    cout << "\n==================== Comparison ====================" << endl;
+    cout << "  Plaintext ADMM final obj : " << fixed << setprecision(6) << objPlain << endl;
+    cout << "  TRIAD (encrypted) final obj: " << fixed << setprecision(6) << objTriad << endl;
+    cout << "  Relative gap : "
+         << fixed << setprecision(4) << fabs(objTriad-objPlain)/max(objPlain,1e-12)*100 << "%" << endl;
+    cout << "  (see plaintext_admm_log.csv vs server_log.csv for per-iter curves)" << endl;
+    cout << "=====================================================" << endl;
 
     for (int i = 0; i < NUM_PARTIES; i++) netClose(fds[i]);
     log.close();

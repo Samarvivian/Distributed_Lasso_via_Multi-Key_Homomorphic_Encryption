@@ -71,10 +71,15 @@ static const double delta_safe     = 0.95;
 static const int    Lmin_levels    = 6;     // FIX: must match server.cpp
 static const double B_mask         = 10.0;
 
-static const uint32_t MAGIC_READY    = 0xCAFEBABE;
-static const uint32_t MAGIC_REFRESH  = 0xABCD1234;
-static const uint32_t MAGIC_ITERDONE = 0x00000001;
-static const uint32_t MAGIC_END      = 0xFFFFFFFF;
+static const uint32_t MAGIC_READY       = 0xCAFEBABE;
+static const uint32_t MAGIC_REFRESH     = 0xABCD1234;
+static const uint32_t MAGIC_ITERDONE   = 0x00000001;
+static const uint32_t MAGIC_END         = 0xFFFFFFFF;
+static const uint32_t MAGIC_PLAIN_ADMM  = 0xAAAAAAAA;
+static const uint32_t MAGIC_TRIAD_START = 0xBBBBBBBB;
+static const uint32_t MAGIC_STATIC_R    = 0xCCCCCCCC;
+static const uint32_t MAGIC_ADAPTIVE    = 0xDDDDDDDD;
+static const uint32_t MAGIC_ALL_DONE    = 0xEEEEEEEE;
 
 // ============================================================================
 // Network helpers
@@ -121,6 +126,11 @@ static vector<double> recvVec(int fd) {
     vector<double> v(bytes / 8);
     recvAll(fd, (char*)v.data(), bytes);
     return v;
+}
+static void sendVec(int fd, const vector<double>& v) {
+    uint32_t n = htonl((uint32_t)(v.size() * 8));
+    sendAll(fd, (char*)&n, 4);
+    sendAll(fd, (char*)v.data(), v.size() * 8);
 }
 static void     sendD  (int fd, double   v) { sendAll(fd, (char*)&v, 8); }
 static double   recvD  (int fd)             { double v; recvAll(fd, (char*)&v, 8); return v; }
@@ -301,6 +311,33 @@ int main(int argc, char* argv[]) {
     auto Mi  = invertSPD(matadd(AtA, eye(N_FEAT, rho)));
     auto gi  = matvec(At, bi);
     cout << "  Done (t=" << elapsed() << "s)" << endl;
+
+    // -----------------------------------------------------------------------
+    // Distributed Plaintext ADMM (runs before TRIAD)
+    // -----------------------------------------------------------------------
+    {
+        uint32_t sig = recvU32(fd);
+        if (sig != MAGIC_PLAIN_ADMM)
+            throw runtime_error("Expected MAGIC_PLAIN_ADMM, got: " + to_string(sig));
+        cout << "\n[PlainADMM] Starting plaintext ADMM loop..." << endl;
+
+        for (int iter = 0; iter < maxIter; iter++) {
+            cout << "  [PlainADMM] iter=" << setw(2) << iter
+                 << "  t=" << fixed << setprecision(1) << elapsed() << "s" << endl;
+            cout.flush();
+            // Receive v_i = z - u_i from server
+            auto vi_plain = recvVec(fd);
+            // x-update: x_i = M_i * (g_i + rho * v_i)
+            auto xi_plain = matvec(Mi, vecadd(gi, vecscale(vi_plain, rho)));
+            // Send x_i back to server
+            sendVec(fd, xi_plain);
+        }
+
+        sig = recvU32(fd);
+        if (sig != MAGIC_TRIAD_START)
+            throw runtime_error("Expected MAGIC_TRIAD_START, got: " + to_string(sig));
+        cout << "[PlainADMM] Done. Proceeding to TRIAD..." << endl;
+    }
 
     // -----------------------------------------------------------------------
     // Phase 1: Bootstrap R
