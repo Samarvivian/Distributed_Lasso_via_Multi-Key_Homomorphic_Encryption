@@ -1,0 +1,35 @@
+cmake_minimum_required(VERSION 3.16)
+project(TRIAD_CLIENT)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release)
+endif()
+
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -DNDEBUG")
+
+find_package(OpenFHE REQUIRED)
+find_package(OpenMP)
+include_directories(${OpenFHE_INCLUDE_DIRS})
+link_directories(${OpenFHE_LIBRARY_DIRS})
+
+include_directories(
+    /usr/local/include
+    /usr/local/include/openfhe
+    /usr/local/include/openfhe/core
+    /usr/local/include/openfhe/pke
+    /usr/local/include/openfhe/binfhe
+)
+link_directories(/usr/local/lib)
+
+add_executable(client client.cpp)
+target_link_libraries(client OPENFHEpke OPENFHEcore OPENFHEbinfhe)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(client OpenMP::OpenMP_CXX)
+endif()
+target_link_options(client PRIVATE
+    -Wl,--whole-archive
+    /usr/local/lib/libOPENFHEpke.so
+    -Wl,--no-whole-archive)

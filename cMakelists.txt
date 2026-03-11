@@ -1,0 +1,47 @@
+cmake_minimum_required(VERSION 3.16)
+project(TRIAD)
+
+set(CMAKE_CXX_STANDARD 17)
+
+find_package(OpenFHE REQUIRED)
+include_directories(${OpenFHE_INCLUDE_DIRS})
+link_directories(${OpenFHE_LIBRARY_DIRS})
+
+if(WIN32)
+  include_directories(D:/CKKS/openfhe-install/include)
+  include_directories(D:/CKKS/openfhe-install/include/openfhe)
+  include_directories(D:/CKKS/openfhe-install/include/openfhe/core)
+  include_directories(D:/CKKS/openfhe-install/include/openfhe/pke)
+  include_directories(D:/CKKS/openfhe-install/include/openfhe/binfhe)
+  link_directories(D:/CKKS/openfhe-install/lib)
+else()
+  include_directories(/usr/local/include/openfhe)
+  include_directories(/usr/local/include/openfhe/core)
+  include_directories(/usr/local/include/openfhe/pke)
+  include_directories(/usr/local/include/openfhe/binfhe)
+  link_directories(/usr/local/lib)
+endif()
+
+# keygen: no networking, runs on any platform
+add_executable(keygen keygen.cpp)
+target_link_libraries(keygen OPENFHEpke)
+
+# server and client: Winsock on Windows, POSIX on Linux
+add_executable(server server.cpp)
+add_executable(client client.cpp)
+
+if(WIN32)
+    target_link_libraries(keygen OPENFHEpke)
+    target_link_libraries(server OPENFHEpke ws2_32)
+    target_link_libraries(client OPENFHEpke ws2_32)
+else()
+    target_link_libraries(keygen OPENFHEpke OPENFHEcore OPENFHEbinfhe)
+    target_link_libraries(server OPENFHEpke OPENFHEcore OPENFHEbinfhe)
+    target_link_libraries(client OPENFHEpke OPENFHEcore OPENFHEbinfhe)
+    foreach(tgt keygen server client)
+        target_link_options(${tgt} PRIVATE
+            -Wl,--whole-archive
+            /usr/local/lib/libOPENFHEpke.so
+            -Wl,--no-whole-archive)
+    endforeach()
+endif()
