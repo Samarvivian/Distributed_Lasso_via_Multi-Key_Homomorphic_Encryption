@@ -81,6 +81,7 @@ static const uint32_t MAGIC_STATIC_R    = 0xCCCCCCCC;
 static const uint32_t MAGIC_ADAPTIVE    = 0xDDDDDDDD;
 static const uint32_t MAGIC_ALL_DONE    = 0xEEEEEEEE;
 static const uint32_t MAGIC_ABORT_SR    = 0xCC1EAF01;  // early-abort for Static-R experiment
+static const uint32_t MAGIC_CONTINUE_ITER = 0x00000003; // proceed with next iteration
 
 // ============================================================================
 // Network helpers
@@ -359,6 +360,16 @@ int main(int argc, char* argv[]) {
 
             // ADMM iterations — same as TRIAD Phase 2 but WITHOUT CRC (step e)
             for (int iter = 0; iter < maxIter; iter++) {
+                // Pre-iteration handshake: server signals abort or continue
+                uint32_t iterCtrl = recvU32(fd);
+                if (iterCtrl == MAGIC_ABORT_SR) {
+                    cout << "  [ABORT_SR] server aborted StaticR="
+                         << fixed << setprecision(1) << fixedR
+                         << " — proceeding to final decrypt" << endl;
+                    break;
+                }
+                // else MAGIC_CONTINUE_ITER — proceed normally
+
                 cout << "  iter=" << setw(2) << iter
                      << "  t=" << fixed << setprecision(1) << elapsed() << "s" << endl;
                 cout.flush();
@@ -413,16 +424,8 @@ int main(int argc, char* argv[]) {
                 encUiS = cc->EvalAdd(encUiS, cc->EvalSub(encXiS, encZnewS));
                 sendObj(fd, encUiS, cc);
 
-                // h) MAGIC_ABORT_SR (early-abort), MAGIC_REFRESH, or MAGIC_ITERDONE
+                // h) MAGIC_REFRESH or MAGIC_ITERDONE
                 uint32_t flagS = recvU32(fd);
-                if (flagS == MAGIC_ABORT_SR) {
-                    // Server detected explosion/decrypt-fail — exit iteration loop.
-                    // Final-decrypt sequence follows immediately (MAGIC_END + enc(z)).
-                    cout << "  [ABORT_SR] server aborted StaticR=" << fixed
-                         << setprecision(1) << fixedR
-                         << " early — proceeding to final decrypt" << endl;
-                    break;
-                }
                 if (flagS == MAGIC_REFRESH) {
                     auto encZrefS = recvObj<Ciphertext<DCRTPoly>>(fd, cc);
                     Ciphertext<DCRTPoly> partZS;

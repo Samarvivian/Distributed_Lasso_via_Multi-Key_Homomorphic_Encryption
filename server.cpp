@@ -38,6 +38,7 @@
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
+#include <limits>
 #include <chrono>
 #include <iomanip>
 
@@ -98,6 +99,7 @@ static const uint32_t MAGIC_STATIC_R    = 0xCCCCCCCC;
 static const uint32_t MAGIC_ADAPTIVE    = 0xDDDDDDDD;
 static const uint32_t MAGIC_ALL_DONE    = 0xEEEEEEEE;
 static const uint32_t MAGIC_ABORT_SR    = 0xCC1EAF01;  // early-abort for Static-R experiment
+static const uint32_t MAGIC_CONTINUE_ITER = 0x00000003; // proceed with next iteration
 
 // ============================================================================
 // Network helpers
@@ -494,6 +496,19 @@ int main() {
         for (int iter = 0; iter < maxIter; iter++) {
             bool did_ref = false;
             size_t remLev = totalLevels - encZS->GetLevel() - 1;
+
+            // ── Pre-iteration handshake: abort immediately or signal clients to continue ──
+            if (abort_next) {
+                cout << "  [ABORT] " << label << " aborted at iter=" << iter
+                     << " — skipping remaining iterations" << endl;
+                bcastU32(fds, MAGIC_ABORT_SR);
+                slog << iter << "," << RS << "," << remLev
+                     << "," << 0 << ",ABORT," << elapsed() << "\n";
+                slog.flush();
+                break;
+            }
+            bcastU32(fds, MAGIC_CONTINUE_ITER);
+
             cout << "  iter=" << setw(2) << iter
                  << "  R=" << RS << "  remLev=" << remLev
                  << "  t=" << fixed << setprecision(1) << elapsed() << "s" << endl;
@@ -541,18 +556,8 @@ int main() {
             encZS = encZnewS;
             cout << "    [g] enc(z) broadcast, enc(u_i) collected" << endl; cout.flush();
 
-            // h) Refresh, early-abort, or ITERDONE
+            // h) Refresh or ITERDONE
             remLev = totalLevels - encZS->GetLevel() - 1;
-            if (abort_next) {
-                // Signal clients to exit their iteration loop, then proceed to final decrypt
-                cout << "    [ABORT] early-abort at iter=" << iter
-                     << " — skipping remainder of " << label << endl;
-                bcastU32(fds, MAGIC_ABORT_SR);
-                slog << iter << "," << RS << "," << remLev
-                     << "," << did_ref << ",ABORT," << elapsed() << "\n";
-                slog.flush();
-                break;
-            }
             if ((int)remLev < Lmin_levels) {
                 did_ref = true;
                 cout << "    [h] Refresh (remLev=" << remLev << ")..." << endl; cout.flush();
@@ -617,17 +622,35 @@ int main() {
         }
         slog.close();
         // Final decrypt for this static-R run
+        cout << "  [FinalDecrypt] sending MAGIC_END, collecting shares..." << endl;
+        cout.flush();
         bcastU32(fds, MAGIC_END);
         bcast(fds, encZS, cc);
+        cout << "  [FinalDecrypt] enc(z) sent, waiting for partial decrypts..." << endl;
+        cout.flush();
         vector<Ciphertext<DCRTPoly>> fshS(NUM_PARTIES);
-        for (int i = 0; i < NUM_PARTIES; i++)
+        for (int i = 0; i < NUM_PARTIES; i++) {
             fshS[i] = recvObj<Ciphertext<DCRTPoly>>(fds[i], cc);
-        Plaintext ptFS; cc->MultipartyDecryptFusion(fshS, &ptFS);
-        ptFS->SetLength(N_FEAT);
-        auto zFS = ptFS->GetRealPackedValue();
-        for (int i = 0; i < NUM_PARTIES; i++) sendVec(fds[i], zFS);
-        double finalObjS = computeObjective(zFS, globalA, globalB);
-        cout << "  Final obj=" << finalObjS;
+            cout << "  [FinalDecrypt] got partial from client " << i
+                 << "  t=" << fixed << setprecision(1) << elapsed() << "s" << endl;
+            cout.flush();
+        }
+        cout << "  [FinalDecrypt] fusing..." << endl; cout.flush();
+        double finalObjS = std::numeric_limits<double>::quiet_NaN();
+        try {
+            Plaintext ptFS; cc->MultipartyDecryptFusion(fshS, &ptFS);
+            ptFS->SetLength(N_FEAT);
+            auto zFS = ptFS->GetRealPackedValue();
+            for (int i = 0; i < NUM_PARTIES; i++) sendVec(fds[i], zFS);
+            finalObjS = computeObjective(zFS, globalA, globalB);
+            cout << "  Final obj=" << finalObjS;
+        } catch (...) {
+            cout << "  [FINAL_DECRYPT_FAIL] decryption failed for " << label
+                 << " — sending zero vec to keep sync" << endl;
+            vector<double> zeroVec(N_FEAT, 0.0);
+            for (int i = 0; i < NUM_PARTIES; i++) sendVec(fds[i], zeroVec);
+            exploded = true;
+        }
         if (exploded) cout << "  [EXPLODED]";
         cout << "\n  t=" << elapsed() << "s" << endl;
         srResults.push_back({label, finalObjS, exploded});
@@ -662,7 +685,7 @@ int main() {
     cc->MultipartyDecryptFusion(sh0, &ptSq);
     ptSq->SetLength(1);
     double sumSq    = max(0.0, ptSq->GetRealPackedValue()[0]);
-    double currentR = max({1.5 * sqrt(sumSq / N_FEAT), 3.0 * kappa, 2.0});
+    double currentR = max({1.5 * sqrt(sumSq / N_FEAT), 3.0 * kappa, 1.5});
     bcastD(fds, currentR);
     cout << "  R^(0)=" << currentR << " sumSq=" << sumSq
          << " kappa=" << kappa << " (t=" << elapsed() << "s)" << endl;
