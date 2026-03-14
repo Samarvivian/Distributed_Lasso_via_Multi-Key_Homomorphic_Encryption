@@ -1,21 +1,16 @@
 /**
- * @file client.cpp
- * @brief TRIAD Protocol - Client (runs on Raspberry Pi or local process)
+ * @file client_real.cpp
+ * @brief TRIAD Protocol - Client, Riboflavin real-data experiment
+ *
+ * Data layout:
+ *   client 0: rows  0-23  (24 samples)
+ *   client 1: rows 24-47  (24 samples)
+ *   client 2: rows 48-70  (23 samples)
+ *
+ * Data files: data/riboflavin_X.csv, data/riboflavin_y.csv
  *
  * Usage:
- *   ./client 0    (party 0, listens on BASE_PORT+0)
- *   ./client 1    (party 1, listens on BASE_PORT+1)
- *   ./client 2    (party 2, listens on BASE_PORT+2)
- *
- * Prerequisites:
- *   keys/cryptocontext.bin  keys/joint_pk.bin  keys/sk_<id>.bin
- *
- * FIXES vs previous version:
- *   - lambda_lasso = 0.1  (must match server.cpp)
- *   - Protocol order: Phase A (all v) → send x → Phase C (all u)
- *     Client now loops j=0..K-1 for ALL v decrypts before sending x,
- *     then loops j=0..K-1 for ALL u decrypts. Matches server.cpp exactly.
- *   - Objective side-decrypt added at end of each iter (matches server.cpp step j)
+ *   ./client_real <party_id 0|1|2> [--triad-only]
  */
 
 #include "openfhe/pke/openfhe.h"
@@ -33,14 +28,10 @@
 #include <chrono>
 #include <iomanip>
 
-// ============================================================================
-// Cross-platform socket
-// ============================================================================
 #ifdef _WIN32
   #include <winsock2.h>
   #include <ws2tcpip.h>
   #pragma comment(lib, "ws2_32.lib")
-  typedef int ssize_t;
   static void netInit() { WSADATA w; WSAStartup(MAKEWORD(2,2), &w); }
   static void netClose(int fd) { closesocket((SOCKET)(uintptr_t)fd); }
 #else
@@ -56,33 +47,35 @@ using namespace lbcrypto;
 using namespace std;
 
 // ============================================================================
-// Config — must match keygen.cpp and server.cpp EXACTLY
+// Config — must match server_real.cpp and keygen_real.cpp EXACTLY
 // ============================================================================
 static const int    NUM_PARTIES    = 3;
 static const int    BASE_PORT      = 10000;
-static const size_t N_FEAT         = 200;
-static const size_t M_ROWS         = 50;
+static const size_t N_FEAT         = 4088;
+static const int    TOTAL_ROWS     = 71;
 static const double rho            = 1.0;
-static const double lambda_lasso   = 0.1;   // FIX: must match server.cpp
-static const int    maxIter        = 50;
+static const double lambda_lasso   = 0.01;
+static const int    maxIter        = 100;
 static const int    updateInterval = 5;
 static const int    shrinkWarmup   = 5;
 static const double delta_safe     = 0.95;
 static const double gamma_smooth   = 0.8;
-static const int    Lmin_levels    = 6;     // FIX: must match server.cpp
+static const int    Lmin_levels    = 6;
 static const double B_mask         = 10.0;
+
+// rows assigned to each client (must match server_real.cpp)
+static const int CLIENT_ROW_START[3] = {0,  24, 48};
+static const int CLIENT_ROW_END[3]   = {24, 48, 71};
 
 static const uint32_t MAGIC_READY       = 0xCAFEBABE;
 static const uint32_t MAGIC_REFRESH     = 0xABCD1234;
-static const uint32_t MAGIC_ITERDONE   = 0x00000001;
+static const uint32_t MAGIC_ITERDONE    = 0x00000001;
 static const uint32_t MAGIC_END         = 0xFFFFFFFF;
 static const uint32_t MAGIC_PLAIN_ADMM  = 0xAAAAAAAA;
-static const uint32_t MAGIC_TRIAD_START = 0xBBBBBBBB;
 static const uint32_t MAGIC_STATIC_R    = 0xCCCCCCCC;
-static const uint32_t MAGIC_ADAPTIVE    = 0xDDDDDDDD;
-static const uint32_t MAGIC_ALL_DONE    = 0xEEEEEEEE;
-static const uint32_t MAGIC_ABORT_SR    = 0xCC1EAF01;  // early-abort for Static-R experiment
-static const uint32_t MAGIC_CONTINUE_ITER = 0x00000003; // proceed with next iteration
+static const uint32_t MAGIC_ABORT_SR    = 0xCC1EAF01;
+static const uint32_t MAGIC_CONTINUE_ITER = 0x00000003;
+static const uint32_t MAGIC_TRIAD_START = 0xBBBBBBBB;
 
 // ============================================================================
 // Network helpers
@@ -223,26 +216,85 @@ static vector<double> vecsub(const vector<double>& a, const vector<double>& b) {
 }
 
 // ============================================================================
-// Deterministic data generation (same seed as server.cpp)
+// Data loading — identical partition logic to server_real.cpp
 // ============================================================================
-static void genData(int pid, Mat& Ai, vector<double>& bi) {
-    mt19937 rng(42 + pid * 1000);
-    normal_distribution<double> nd(0,1), noise(0,0.01);
-    uniform_real_distribution<double> ud(1,2);
-    Ai.assign(M_ROWS, vector<double>(N_FEAT));
-    for (size_t j = 0; j < N_FEAT; j++) {
-        double nm = 0;
-        for (size_t i = 0; i < M_ROWS; i++) { Ai[i][j]=nd(rng); nm+=Ai[i][j]*Ai[i][j]; }
-        nm = sqrt(nm);
-        for (size_t i = 0; i < M_ROWS; i++) Ai[i][j] /= nm;
+static void loadRiboflavinClient(int pid, Mat& Ai, vector<double>& bi) {
+    // Load full X
+    ifstream fX("data/riboflavin_X.csv");
+    if (!fX.is_open()) throw runtime_error("Cannot open data/riboflavin_X.csv");
+    string line;
+    getline(fX, line);  // skip header
+    Mat fullX;
+    while (getline(fX, line)) {
+        istringstream ss(line);
+        string tok;
+        vector<double> row;
+        bool firstToken = true;
+        while (getline(ss, tok, ',')) {
+            if (firstToken) {
+                firstToken = false;
+                bool isNum = !tok.empty() &&
+                             (isdigit((unsigned char)tok[0]) || tok[0]=='-' || tok[0]=='.');
+                if (!isNum) continue;
+            }
+            try { row.push_back(stod(tok)); } catch (...) {}
+        }
+        if (!row.empty()) fullX.push_back(row);
     }
-    vector<double> xt(N_FEAT, 0);
-    for (int k = 0; k < 10; k++) xt[k*(N_FEAT/10)] = ud(rng);
-    bi.resize(M_ROWS);
-    for (size_t i = 0; i < M_ROWS; i++) {
-        bi[i] = 0;
-        for (size_t j = 0; j < N_FEAT; j++) bi[i] += Ai[i][j]*xt[j];
-        bi[i] += noise(rng);
+    fX.close();
+    if ((int)fullX.size() != TOTAL_ROWS)
+        throw runtime_error("riboflavin_X.csv: expected " + to_string(TOTAL_ROWS) +
+                            " rows, got " + to_string(fullX.size()));
+
+    // Load full y
+    ifstream fY("data/riboflavin_y.csv");
+    if (!fY.is_open()) throw runtime_error("Cannot open data/riboflavin_y.csv");
+    getline(fY, line);
+    vector<double> fullY;
+    while (getline(fY, line)) {
+        istringstream ss(line);
+        string tok;
+        bool firstToken = true;
+        double val = 0; bool gotVal = false;
+        while (getline(ss, tok, ',')) {
+            if (firstToken) {
+                firstToken = false;
+                bool isNum = !tok.empty() &&
+                             (isdigit((unsigned char)tok[0]) || tok[0]=='-' || tok[0]=='.');
+                if (!isNum) continue;
+            }
+            try { val = stod(tok); gotVal = true; break; } catch (...) {}
+        }
+        if (gotVal) fullY.push_back(val);
+    }
+    fY.close();
+    if ((int)fullY.size() != TOTAL_ROWS)
+        throw runtime_error("riboflavin_y.csv: expected " + to_string(TOTAL_ROWS) +
+                            " rows, got " + to_string(fullY.size()));
+
+    // Column-normalize X (must match server)
+    size_t nrows = fullX.size(), ncols = fullX[0].size();
+    for (size_t j = 0; j < ncols; j++) {
+        double nm = 0;
+        for (size_t i = 0; i < nrows; i++) nm += fullX[i][j] * fullX[i][j];
+        nm = sqrt(nm);
+        if (nm > 1e-12)
+            for (size_t i = 0; i < nrows; i++) fullX[i][j] /= nm;
+    }
+
+    // Center y
+    double mu = 0;
+    for (double v : fullY) mu += v;
+    mu /= fullY.size();
+    for (double& v : fullY) v -= mu;
+
+    // Extract partition for this client
+    int r0 = CLIENT_ROW_START[pid];
+    int r1 = CLIENT_ROW_END[pid];
+    Ai.clear(); bi.clear();
+    for (int r = r0; r < r1; r++) {
+        Ai.push_back(fullX[r]);
+        bi.push_back(fullY[r]);
     }
 }
 
@@ -250,7 +302,7 @@ static void genData(int pid, Mat& Ai, vector<double>& bi) {
 // Main
 // ============================================================================
 int main(int argc, char* argv[]) {
-    if (argc < 2) { cerr << "Usage: ./client <party_id 0|1|2> [--triad-only]\n"; return 1; }
+    if (argc < 2) { cerr << "Usage: ./client_real <party_id 0|1|2> [--triad-only]\n"; return 1; }
     int myId = atoi(argv[1]);
     if (myId < 0 || myId >= NUM_PARTIES) {
         cerr << "party_id must be 0.." << (NUM_PARTIES-1) << "\n"; return 1;
@@ -265,8 +317,10 @@ int main(int argc, char* argv[]) {
     };
 
     netInit();
-    cout << "=== TRIAD Client " << myId << " ===" << endl;
-    cout << "  lambda=" << lambda_lasso << " Lmin=" << Lmin_levels << endl;
+    cout << "=== TRIAD Client (Riboflavin) " << myId << " ===" << endl;
+    cout << "  N_FEAT=" << N_FEAT << " lambda=" << lambda_lasso
+         << " rows=[" << CLIENT_ROW_START[myId] << "," << CLIENT_ROW_END[myId] << ")"
+         << " Lmin=" << Lmin_levels << endl;
 
     // -----------------------------------------------------------------------
     // Load keys
@@ -307,19 +361,58 @@ int main(int argc, char* argv[]) {
     sendU32(fd, MAGIC_READY);
 
     // -----------------------------------------------------------------------
-    // Precompute M_i, g_i
+    // Precompute M_i, g_i from Riboflavin data
     // -----------------------------------------------------------------------
-    cout << "\n[Precompute] M_i and g_i..." << endl;
+    cout << "\n[Precompute] Loading data and computing M_i, g_i..." << endl;
     Mat Ai; vector<double> bi;
-    genData(myId, Ai, bi);
-    auto At  = transpose(Ai);
-    auto AtA = matmul(At, Ai);
-    auto Mi  = invertSPD(matadd(AtA, eye(N_FEAT, rho)));
-    auto gi  = matvec(At, bi);
-    cout << "  Done (t=" << elapsed() << "s)" << endl;
+    loadRiboflavinClient(myId, Ai, bi);
+    size_t mi = Ai.size();  // number of rows for this client (24 or 23)
+    cout << "  Data loaded: " << mi << " rows x " << Ai[0].size()
+         << " cols (t=" << elapsed() << "s)" << endl;
+
+    // x-update via Woodbury identity (avoids 4088x4088 inversion):
+    //   (rho*I + A'A)^{-1} v = (1/rho)*v - (1/rho)*A'*(I_m + (1/rho)*A*A')^{-1}*(1/rho)*A*v
+    // Only need to invert an m×m matrix (m=24 or 23).
+    auto At  = transpose(Ai);                     // N_FEAT x mi
+    auto AAt = matmul(Ai, At);                    // mi x mi
+    // B = I_m + (1/rho)*A*A'
+    Mat B = eye(mi, 1.0);
+    for (size_t r = 0; r < mi; r++)
+        for (size_t c = 0; c < mi; c++)
+            B[r][c] += (1.0/rho) * AAt[r][c];
+    auto Binv = invertSPD(B);                     // mi x mi  (fast!)
+    auto gi   = matvec(At, bi);                   // N_FEAT
+    cout << "  Woodbury precompute done (t=" << elapsed() << "s)" << endl;
+
+    // Helper: x_i = M_i * (g_i + rho*v_i)  using Woodbury
+    // = (1/rho)*(g_i+rho*v_i) - (1/rho)*A'*Binv*(1/rho)*A*(g_i+rho*v_i)
+    auto woodburyXupdate = [&](const vector<double>& v) -> vector<double> {
+        // rhs = g_i + rho*v_i
+        vector<double> rhs(N_FEAT);
+        for (size_t j = 0; j < N_FEAT; j++) rhs[j] = gi[j] + rho * v[j];
+        // term1 = (1/rho)*rhs
+        vector<double> term1(N_FEAT);
+        for (size_t j = 0; j < N_FEAT; j++) term1[j] = rhs[j] / rho;
+        // Arhs = A * rhs  (mi-vector)
+        vector<double> Arhs(mi, 0.0);
+        for (size_t r = 0; r < mi; r++)
+            for (size_t j = 0; j < N_FEAT; j++) Arhs[r] += Ai[r][j] * rhs[j];
+        // BinvArhs = Binv * Arhs  (mi-vector)
+        vector<double> BinvArhs(mi, 0.0);
+        for (size_t r = 0; r < mi; r++)
+            for (size_t c = 0; c < mi; c++) BinvArhs[r] += Binv[r][c] * Arhs[c];
+        // correction = (1/rho)*A'*BinvArhs  (N_FEAT-vector)
+        vector<double> corr(N_FEAT, 0.0);
+        for (size_t j = 0; j < N_FEAT; j++)
+            for (size_t r = 0; r < mi; r++) corr[j] += At[j][r] * BinvArhs[r];
+        // result = term1 - (1/rho)*corr
+        vector<double> result(N_FEAT);
+        for (size_t j = 0; j < N_FEAT; j++) result[j] = term1[j] - corr[j] / rho;
+        return result;
+    };
 
     // -----------------------------------------------------------------------
-    // Distributed Plaintext ADMM (runs before TRIAD)
+    // Distributed Plaintext ADMM
     // -----------------------------------------------------------------------
     if (!triadOnly) {
     {
@@ -332,145 +425,144 @@ int main(int argc, char* argv[]) {
             cout << "  [PlainADMM] iter=" << setw(2) << iter
                  << "  t=" << fixed << setprecision(1) << elapsed() << "s" << endl;
             cout.flush();
-            // Receive v_i = z - u_i from server
             auto vi_plain = recvVec(fd);
-            // x-update: x_i = M_i * (g_i + rho * v_i)
-            auto xi_plain = matvec(Mi, vecadd(gi, vecscale(vi_plain, rho)));
-            // Send x_i back to server
+            auto xi_plain = woodburyXupdate(vi_plain);
             sendVec(fd, xi_plain);
         }
 
-        // -----------------------------------------------------------------------
-        // Static-R experiments: handle any MAGIC_STATIC_R before MAGIC_TRIAD_START
-        // -----------------------------------------------------------------------
-        while (true) {
-            sig = recvU32(fd);
-            if (sig == MAGIC_TRIAD_START) {
-                cout << "[PlainADMM] Done. Proceeding to TRIAD..." << endl;
+        // After PlainADMM: expect Static-R=2.0 phase
+        uint32_t sig2 = recvU32(fd);
+        if (sig2 != MAGIC_STATIC_R)
+            throw runtime_error("Expected MAGIC_STATIC_R after PlainADMM, got: " + to_string(sig2));
+        double sr = recvD(fd);
+        cout << "[PlainADMM] Done. Starting Static-R=" << sr << "..." << endl;
+    }
+    } // end if (!triadOnly) — PlainADMM
+
+    // -----------------------------------------------------------------------
+    // Static-R = 2.0 experiment (between PlainADMM and TRIAD)
+    // -----------------------------------------------------------------------
+    if (!triadOnly) {
+    {
+        cout << "\n[Static-R] Running Static-R experiment..." << endl;
+        vector<double> uiS(N_FEAT, 0.0);
+        auto encUiS = cc->Encrypt(jointPK, cc->MakeCKKSPackedPlaintext(vector<double>(N_FEAT, 0.0)));
+        Ciphertext<DCRTPoly> encXiS_curr = encUiS;
+
+        for (int iter = 0; iter < maxIter; iter++) {
+            // Pre-iteration handshake: MAGIC_ABORT_SR or MAGIC_CONTINUE_ITER
+            uint32_t hsig = recvU32(fd);
+            if (hsig == MAGIC_ABORT_SR) {
+                cout << "  [ABORT_SR] iter=" << iter << endl;
                 break;
             }
-            if (sig != MAGIC_STATIC_R)
-                throw runtime_error("Expected MAGIC_STATIC_R or MAGIC_TRIAD_START");
+            if (hsig != MAGIC_CONTINUE_ITER)
+                throw runtime_error("Static-R: unexpected handshake " + to_string(hsig));
 
-            double fixedR = recvD(fd);
-            cout << "\n===== StaticR=" << fixed << setprecision(1) << fixedR
-                 << " =====" << endl;
+            cout << "  [Static-R] iter=" << setw(2) << iter
+                 << "  t=" << fixed << setprecision(1) << elapsed() << "s" << endl;
+            cout.flush();
 
-            // Init state — no Bootstrap R, use fixedR directly
-            vector<double> uiS(N_FEAT, 0.0);
-            auto encUiS = cc->Encrypt(jointPK,
-                              cc->MakeCKKSPackedPlaintext(vector<double>(N_FEAT, 0.0)));
-            Ciphertext<DCRTPoly> encXiS = cc->Encrypt(jointPK,
-                              cc->MakeCKKSPackedPlaintext(vector<double>(N_FEAT, 0.0)));
+            // a) Send fresh masks
+            vector<double> rvS(N_FEAT), ruS(N_FEAT);
+            for (auto& v : rvS) v = maskDist(rng);
+            for (auto& v : ruS) v = maskDist(rng);
+            auto encRvS = cc->Encrypt(jointPK, cc->MakeCKKSPackedPlaintext(rvS));
+            auto encRuS = cc->Encrypt(jointPK, cc->MakeCKKSPackedPlaintext(ruS));
+            sendObj(fd, encRvS, cc);
+            sendObj(fd, encRuS, cc);
 
-            // ADMM iterations — same as TRIAD Phase 2 but WITHOUT CRC (step e)
-            for (int iter = 0; iter < maxIter; iter++) {
-                // Pre-iteration handshake: server signals abort or continue
-                uint32_t iterCtrl = recvU32(fd);
-                if (iterCtrl == MAGIC_ABORT_SR) {
-                    cout << "  [ABORT_SR] server aborted StaticR="
-                         << fixed << setprecision(1) << fixedR
-                         << " — proceeding to final decrypt" << endl;
-                    break;
-                }
-                // else MAGIC_CONTINUE_ITER — proceed normally
-
-                cout << "  iter=" << setw(2) << iter
-                     << "  t=" << fixed << setprecision(1) << elapsed() << "s" << endl;
-                cout.flush();
-
-                // a) Send fresh masks
-                vector<double> rvS(N_FEAT), ruS(N_FEAT);
-                for (auto& v : rvS) v = maskDist(rng);
-                for (auto& v : ruS) v = maskDist(rng);
-                auto encRvS = cc->Encrypt(jointPK, cc->MakeCKKSPackedPlaintext(rvS));
-                auto encRuS = cc->Encrypt(jointPK, cc->MakeCKKSPackedPlaintext(ruS));
-                sendObj(fd, encRvS, cc);
-                sendObj(fd, encRuS, cc);
-
-                // b) Phase A: participate in ALL v masked-decrypts
-                vector<double> viS(N_FEAT, 0.0);
-                for (int j = 0; j < NUM_PARTIES; j++) {
-                    auto encVjM = recvObj<Ciphertext<DCRTPoly>>(fd, cc);
-                    Ciphertext<DCRTPoly> partV;
-                    if (myId == 0) partV = cc->MultipartyDecryptLead({encVjM}, mySK)[0];
-                    else           partV = cc->MultipartyDecryptMain({encVjM}, mySK)[0];
-                    sendObj(fd, partV, cc);
-                    if (j == myId) {
-                        auto viM = recvVec(fd);
-                        for (size_t k = 0; k < N_FEAT; k++) viS[k] = viM[k] - rvS[k];
-                    }
-                }
-
-                // c) x-update
-                auto xiS = matvec(Mi, vecadd(gi, vecscale(viS, rho)));
-                encXiS = cc->Encrypt(jointPK, cc->MakeCKKSPackedPlaintext(xiS));
-                sendObj(fd, encXiS, cc);
-
-                // d) Phase C: participate in ALL u masked-decrypts
-                for (int j = 0; j < NUM_PARTIES; j++) {
-                    auto encUjM = recvObj<Ciphertext<DCRTPoly>>(fd, cc);
-                    Ciphertext<DCRTPoly> partU;
-                    if (myId == 0) partU = cc->MultipartyDecryptLead({encUjM}, mySK)[0];
-                    else           partU = cc->MultipartyDecryptMain({encUjM}, mySK)[0];
-                    sendObj(fd, partU, cc);
-                    if (j == myId) {
-                        auto uiM = recvVec(fd);
-                        for (size_t k = 0; k < N_FEAT; k++) uiS[k] = uiM[k] - ruS[k];
-                    }
-                }
-
-                // e) [NO CRC for Static-R]
-
-                // f) Receive enc(z)
-                auto encZnewS = recvObj<Ciphertext<DCRTPoly>>(fd, cc);
-
-                // g) u-update
-                encUiS = cc->EvalAdd(encUiS, cc->EvalSub(encXiS, encZnewS));
-                sendObj(fd, encUiS, cc);
-
-                // h) MAGIC_REFRESH or MAGIC_ITERDONE
-                uint32_t flagS = recvU32(fd);
-                if (flagS == MAGIC_REFRESH) {
-                    auto encZrefS = recvObj<Ciphertext<DCRTPoly>>(fd, cc);
-                    Ciphertext<DCRTPoly> partZS;
-                    if (myId == 0) partZS = cc->MultipartyDecryptLead({encZrefS}, mySK)[0];
-                    else           partZS = cc->MultipartyDecryptMain({encZrefS}, mySK)[0];
-                    sendObj(fd, partZS, cc);
-                    auto encZfreshS = recvObj<Ciphertext<DCRTPoly>>(fd, cc);
-                    (void)encZfreshS;
-                    encUiS = cc->Encrypt(jointPK, cc->MakeCKKSPackedPlaintext(uiS));
-                    sendObj(fd, encUiS, cc);
-                }
-
-                // i) Side-decrypt for objective monitoring
-                {
-                    auto encZobjS = recvObj<Ciphertext<DCRTPoly>>(fd, cc);
-                    Ciphertext<DCRTPoly> partObjS;
-                    if (myId == 0) partObjS = cc->MultipartyDecryptLead({encZobjS}, mySK)[0];
-                    else           partObjS = cc->MultipartyDecryptMain({encZobjS}, mySK)[0];
-                    sendObj(fd, partObjS, cc);
+            // b) Participate in all v masked-decrypts; recover own v_i
+            vector<double> viS(N_FEAT, 0.0);
+            for (int j = 0; j < NUM_PARTIES; j++) {
+                auto encVjMasked = recvObj<Ciphertext<DCRTPoly>>(fd, cc);
+                Ciphertext<DCRTPoly> partV;
+                if (myId == 0) partV = cc->MultipartyDecryptLead({encVjMasked}, mySK)[0];
+                else           partV = cc->MultipartyDecryptMain({encVjMasked}, mySK)[0];
+                sendObj(fd, partV, cc);
+                if (j == myId) {
+                    auto viMasked = recvVec(fd);
+                    for (size_t k = 0; k < N_FEAT; k++) viS[k] = viMasked[k] - rvS[k];
                 }
             }
 
-            // Final decrypt for this static-R run
-            if (recvU32(fd) != MAGIC_END)
-                throw runtime_error("Expected MAGIC_END after static-R");
-            auto encZfinalS = recvObj<Ciphertext<DCRTPoly>>(fd, cc);
-            Ciphertext<DCRTPoly> partFinalS;
-            if (myId == 0) partFinalS = cc->MultipartyDecryptLead({encZfinalS}, mySK)[0];
-            else           partFinalS = cc->MultipartyDecryptMain({encZfinalS}, mySK)[0];
-            sendObj(fd, partFinalS, cc);
-            auto zFinalS = recvVec(fd); zFinalS.resize(N_FEAT);
-            cout << "StaticR=" << fixedR << " done. z[0..4]:";
-            for (int i = 0; i < 5; i++)
-                cout << " " << fixed << setprecision(4) << zFinalS[i];
-            cout << "\nt=" << elapsed() << "s" << endl;
-        }  // end static-R loop
+            // c) x-update and send enc(x_i)
+            auto xiS = woodburyXupdate(viS);
+            encXiS_curr = cc->Encrypt(jointPK, cc->MakeCKKSPackedPlaintext(xiS));
+            sendObj(fd, encXiS_curr, cc);
+
+            // d) Participate in all u masked-decrypts; recover own u_i
+            for (int j = 0; j < NUM_PARTIES; j++) {
+                auto encUjMasked = recvObj<Ciphertext<DCRTPoly>>(fd, cc);
+                Ciphertext<DCRTPoly> partU;
+                if (myId == 0) partU = cc->MultipartyDecryptLead({encUjMasked}, mySK)[0];
+                else           partU = cc->MultipartyDecryptMain({encUjMasked}, mySK)[0];
+                sendObj(fd, partU, cc);
+                if (j == myId) {
+                    auto uiMasked = recvVec(fd);
+                    for (size_t k = 0; k < N_FEAT; k++) uiS[k] = uiMasked[k] - ruS[k];
+                }
+            }
+
+            // e) (No CRC for Static-R — skip)
+
+            // f) Receive enc(z^new)
+            auto encZnewS = recvObj<Ciphertext<DCRTPoly>>(fd, cc);
+
+            // g) Homomorphic u-update
+            encUiS = cc->EvalAdd(encUiS, cc->EvalSub(encXiS_curr, encZnewS));
+            sendObj(fd, encUiS, cc);
+
+            // h) Handle MAGIC_REFRESH or MAGIC_ITERDONE
+            uint32_t flagS = recvU32(fd);
+            if (flagS == MAGIC_REFRESH) {
+                cout << "    [Static-R] REFRESH" << endl;
+                auto encZrefS = recvObj<Ciphertext<DCRTPoly>>(fd, cc);
+                Ciphertext<DCRTPoly> partZS;
+                if (myId == 0) partZS = cc->MultipartyDecryptLead({encZrefS}, mySK)[0];
+                else           partZS = cc->MultipartyDecryptMain({encZrefS}, mySK)[0];
+                sendObj(fd, partZS, cc);
+                auto encZfreshS = recvObj<Ciphertext<DCRTPoly>>(fd, cc);
+                (void)encZfreshS;
+                encUiS = cc->Encrypt(jointPK, cc->MakeCKKSPackedPlaintext(uiS));
+                sendObj(fd, encUiS, cc);
+                cout << "    [Static-R] Refresh done" << endl;
+            }
+
+            // i) Side-decrypt for server objective monitoring
+            {
+                auto encZobjS = recvObj<Ciphertext<DCRTPoly>>(fd, cc);
+                Ciphertext<DCRTPoly> partObjS;
+                if (myId == 0) partObjS = cc->MultipartyDecryptLead({encZobjS}, mySK)[0];
+                else           partObjS = cc->MultipartyDecryptMain({encZobjS}, mySK)[0];
+                sendObj(fd, partObjS, cc);
+            }
+
+            cout << "    [Static-R iter " << iter << " done] t="
+                 << fixed << setprecision(1) << elapsed() << "s" << endl;
+            cout.flush();
+        }
+
+        // Final decrypt for Static-R
+        if (recvU32(fd) != MAGIC_END)
+            throw runtime_error("Expected MAGIC_END after Static-R loop");
+        auto encZfinalS = recvObj<Ciphertext<DCRTPoly>>(fd, cc);
+        Ciphertext<DCRTPoly> partFinalS;
+        if (myId == 0) partFinalS = cc->MultipartyDecryptLead({encZfinalS}, mySK)[0];
+        else           partFinalS = cc->MultipartyDecryptMain({encZfinalS}, mySK)[0];
+        sendObj(fd, partFinalS, cc);
+        auto zFinalS = recvVec(fd);
+        zFinalS.resize(N_FEAT);
+        cout << "[Static-R] Done (t=" << fixed << setprecision(1) << elapsed() << "s)" << endl;
+
+        // Expect MAGIC_TRIAD_START
+        uint32_t sig3 = recvU32(fd);
+        if (sig3 != MAGIC_TRIAD_START)
+            throw runtime_error("Expected MAGIC_TRIAD_START after Static-R, got: " + to_string(sig3));
+        cout << "[Static-R] Proceeding to TRIAD..." << endl;
     }
-    } // end if (!triadOnly) — PlainADMM+StaticR
+    } // end if (!triadOnly) — Static-R
     else {
-        // triad-only mode: receive MAGIC_TRIAD_START directly
         uint32_t sig = recvU32(fd);
         if (sig != MAGIC_TRIAD_START)
             throw runtime_error("Expected MAGIC_TRIAD_START in triad-only mode");
@@ -481,7 +573,7 @@ int main(int argc, char* argv[]) {
     // Phase 1: Bootstrap R
     // -----------------------------------------------------------------------
     cout << "\n[Phase 1] Bootstrap R..." << endl;
-    auto xi    = matvec(Mi, gi);
+    auto xi    = woodburyXupdate(vector<double>(N_FEAT, 0.0));
     auto encXi = cc->Encrypt(jointPK, cc->MakeCKKSPackedPlaintext(xi));
     sendObj(fd, encXi, cc);
 
@@ -508,7 +600,7 @@ int main(int argc, char* argv[]) {
              << "  t=" << fixed << setprecision(1) << elapsed() << "s" << endl;
         cout.flush();
 
-        // a) Send fresh masks enc(r_v), enc(r_u)
+        // a) Send fresh masks
         vector<double> rv(N_FEAT), ru(N_FEAT);
         for (auto& v : rv) v = maskDist(rng);
         for (auto& v : ru) v = maskDist(rng);
@@ -518,8 +610,7 @@ int main(int argc, char* argv[]) {
         sendObj(fd, encRu, cc);
         cout << "    [a] masks sent" << endl; cout.flush();
 
-        // b) Phase A: participate in ALL v masked-decrypts (j=0..K-1)
-        //    For j==myId: also receive plaintext(v_i + r_v), recover v_i
+        // b) Phase A: participate in ALL v masked-decrypts
         vector<double> vi(N_FEAT, 0.0);
         for (int j = 0; j < NUM_PARTIES; j++) {
             auto encVjMasked = recvObj<Ciphertext<DCRTPoly>>(fd, cc);
@@ -535,12 +626,12 @@ int main(int argc, char* argv[]) {
         }
 
         // c) x-update and send enc(x_i)
-        xi = matvec(Mi, vecadd(gi, vecscale(vi, rho)));
+        xi = woodburyXupdate(vi);
         encXi_curr = cc->Encrypt(jointPK, cc->MakeCKKSPackedPlaintext(xi));
         sendObj(fd, encXi_curr, cc);
         cout << "    [c] enc(x_i) sent" << endl; cout.flush();
 
-        // d) Phase C: participate in ALL u masked-decrypts (j=0..K-1)
+        // d) Phase C: participate in ALL u masked-decrypts
         for (int j = 0; j < NUM_PARTIES; j++) {
             auto encUjMasked = recvObj<Ciphertext<DCRTPoly>>(fd, cc);
             Ciphertext<DCRTPoly> partU;
@@ -565,9 +656,9 @@ int main(int argc, char* argv[]) {
             auto wi = vecadd(xi, ui);
             double maxW = 0;
             for (auto v : wi) maxW = max(maxW, abs(v));
-            bool safe = (maxW <= delta_safe * currentR);  // 用currentR而不是R_raw
+            bool safe = (maxW <= delta_safe * currentR);
             sendBool(fd, safe);
-            // 同步更新currentR，与server保持一致
+            // Mirror server R update
             double oldR = currentR;
             if (R_raw > currentR) {
                 currentR = R_raw;
@@ -584,7 +675,7 @@ int main(int argc, char* argv[]) {
         auto encZnew = recvObj<Ciphertext<DCRTPoly>>(fd, cc);
         cout << "    [f] enc(z) received" << endl; cout.flush();
 
-        // g) Homomorphic u-update: enc(u_i) += enc(x_i) - enc(z)
+        // g) Homomorphic u-update
         encUi = cc->EvalAdd(encUi, cc->EvalSub(encXi_curr, encZnew));
         sendObj(fd, encUi, cc);
         cout << "    [g] enc(u_i) sent" << endl; cout.flush();
@@ -598,17 +689,14 @@ int main(int argc, char* argv[]) {
             if (myId == 0) partZ = cc->MultipartyDecryptLead({encZref}, mySK)[0];
             else           partZ = cc->MultipartyDecryptMain({encZref}, mySK)[0];
             sendObj(fd, partZ, cc);
-            // receive fresh enc(z) — server manages it, we just discard
             auto encZfresh = recvObj<Ciphertext<DCRTPoly>>(fd, cc);
             (void)encZfresh;
-            // re-encrypt enc(u_i) from plaintext ui (restores level)
             encUi = cc->Encrypt(jointPK, cc->MakeCKKSPackedPlaintext(ui));
             sendObj(fd, encUi, cc);
             cout << "    [h] Refresh done" << endl;
         }
-        // MAGIC_ITERDONE: nothing to do
 
-        // i) Side-decrypt for server's objective monitoring (step j in server)
+        // i) Side-decrypt for server objective monitoring
         {
             auto encZobj = recvObj<Ciphertext<DCRTPoly>>(fd, cc);
             Ciphertext<DCRTPoly> partObj;
@@ -641,11 +729,10 @@ int main(int argc, char* argv[]) {
         cout << " " << fixed << setprecision(4) << zFinal[i];
     cout << "\nTotal time: " << elapsed() << "s" << endl;
 
-    ofstream out("client" + to_string(myId) + "_result.csv");
+    ofstream out("client_real" + to_string(myId) + "_result.csv");
     for (size_t i = 0; i < N_FEAT; i++) out << i << "," << zFinal[i] << "\n";
     out.close();
 
     netClose(fd);
-    cout << "Client " << myId << " done." << endl;
     return 0;
 }

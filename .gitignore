@@ -1,0 +1,27 @@
+# Build artifacts
+build/
+
+# Keys (never commit secret key material)
+keys/
+
+# Dataset files (too large / not redistributable)
+data/
+
+# Generated figures and logs
+figures/
+*.pdf
+*.png
+*.csv
+*.xlsx
+
+# IDE
+.idea/
+*.user
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Windows
+Thumbs.db
+Desktop.ini

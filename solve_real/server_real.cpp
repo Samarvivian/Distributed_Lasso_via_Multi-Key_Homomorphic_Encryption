@@ -1,30 +1,26 @@
 /**
- * @file server.cpp
- * @brief TRIAD Protocol - Server (runs on the laptop/workstation)
+ * @file server_real.cpp
+ * @brief TRIAD Protocol - Server, Riboflavin real-data experiment
  *
- * Deployment - Distributed mode (Raspberry Pi):
- *   1. Run keygen on this machine first (once):  ./keygen
- *   2. Distribute keys to Pi clients:
- *        for i in 0 1 2; do
- *          scp keys/cryptocontext.bin keys/joint_pk.bin keys/sk_${i}.bin \
- *              pi${i}:~/triad/keys/
- *        done
- *   3. Start clients on each Pi:
- *        Pi0: ./client 0
- *        Pi1: ./client 1
- *        Pi2: ./client 2
- *   4. Start server: ./server
+ * Runs PlainADMM and Adaptive TRIAD on the Riboflavin dataset (71×4088).
+ * Does NOT include Static-R experiments (only PlainADMM vs TRIAD comparison).
  *
- * Deployment - Local multi-process mode (single machine):
- *   Set CLIENT_IPS all to "127.0.0.1", then: bash run_local.sh
+ * Data layout across 3 clients:
+ *   client 0: rows  0-23  (24 samples)
+ *   client 1: rows 24-47  (24 samples)
+ *   client 2: rows 48-70  (23 samples)
  *
- * NUM_PARTIES = 3
- * Server does NOT hold any secret key.
+ * Data files (relative to working directory):
+ *   data/riboflavin_X.csv   (71 rows × 4088 cols, with header)
+ *   data/riboflavin_y.csv   (71 rows × 1 col,  with header)
  *
- * FIXES vs previous version:
- *   - lambda_lasso = 0.1  (was 1.0 in server.cpp — caused obj~1e14)
- *   - Lmin_levels  = 6    (was 3  — triggered Refresh too late, noise overflow)
- *   - R^(0) floor  = 5.0  (was missing — near-zero R breaks Cheby approximation)
+ * Output logs (all with _real suffix):
+ *   plaintext_admm_real_log.csv
+ *   Adaptive_TRIAD_real_log.csv
+ *   timing_real_log.csv
+ *
+ * Usage:
+ *   ./server_real [--triad-only]
  */
 
 #include "openfhe/pke/openfhe.h"
@@ -41,10 +37,8 @@
 #include <limits>
 #include <chrono>
 #include <iomanip>
+#include <numeric>
 
-// ============================================================================
-// Cross-platform socket
-// ============================================================================
 #ifdef _WIN32
   #include <winsock2.h>
   #include <ws2tcpip.h>
@@ -64,42 +58,45 @@ using namespace lbcrypto;
 using namespace std;
 
 // ============================================================================
-// Config — must match keygen.cpp and client.cpp EXACTLY
+// Config
 // ============================================================================
 static const int    NUM_PARTIES    = 3;
 static const int    BASE_PORT      = 10000;
-static const size_t N_FEAT         = 200;
-static const size_t M_ROWS         = 50;
+static const size_t N_FEAT         = 4088;
+static const size_t M_ROWS_MAX     = 24;   // max rows per client (client 2 has 23)
+static const int    TOTAL_ROWS     = 71;
 static const double rho            = 1.0;
-static const double lambda_lasso   = 0.1;   // FIX: was 1.0 → caused obj~1e14
-static const int    maxIter        = 50;
+static const double lambda_lasso   = 0.01;  // smaller lambda for real data
+static const int    maxIter        = 100;
 static const int    updateInterval = 5;
 static const int    shrinkWarmup   = 5;
 static const int    chebyDegree    = 15;
 static const double alpha_crc      = 1.2;
 static const double gamma_smooth   = 0.8;
 static const double delta_safe     = 0.95;
-static const int    Lmin_levels    = 6;     // FIX: was 3 → refresh earlier
+static const int    Lmin_levels    = 6;
 static const double kappa          = lambda_lasso / (rho * NUM_PARTIES);
 
-// Pi deployment IPs — set all to "127.0.0.1" for local mode
 static const char* CLIENT_IPS[3] = {
     "192.168.186.223",
     "192.168.186.33",
     "192.168.186.214"
 };
 
-static const uint32_t MAGIC_READY       = 0xCAFEBABE;
-static const uint32_t MAGIC_REFRESH     = 0xABCD1234;
-static const uint32_t MAGIC_ITERDONE   = 0x00000001;
-static const uint32_t MAGIC_END         = 0xFFFFFFFF;
-static const uint32_t MAGIC_PLAIN_ADMM  = 0xAAAAAAAA;
-static const uint32_t MAGIC_TRIAD_START = 0xBBBBBBBB;
-static const uint32_t MAGIC_STATIC_R    = 0xCCCCCCCC;
-static const uint32_t MAGIC_ADAPTIVE    = 0xDDDDDDDD;
-static const uint32_t MAGIC_ALL_DONE    = 0xEEEEEEEE;
-static const uint32_t MAGIC_ABORT_SR    = 0xCC1EAF01;  // early-abort for Static-R experiment
-static const uint32_t MAGIC_CONTINUE_ITER = 0x00000003; // proceed with next iteration
+// rows assigned to each client
+static const int CLIENT_ROW_START[3] = {0,  24, 48};
+static const int CLIENT_ROW_END[3]   = {24, 48, 71};
+
+static const uint32_t MAGIC_READY        = 0xCAFEBABE;
+static const uint32_t MAGIC_REFRESH      = 0xABCD1234;
+static const uint32_t MAGIC_ITERDONE     = 0x00000001;
+static const uint32_t MAGIC_END          = 0xFFFFFFFF;
+static const uint32_t MAGIC_PLAIN_ADMM   = 0xAAAAAAAA;
+static const uint32_t MAGIC_TRIAD_START  = 0xBBBBBBBB;
+static const uint32_t MAGIC_STATIC_R     = 0xCCCCCCCC;
+static const uint32_t MAGIC_ALL_DONE     = 0xEEEEEEEE;
+static const uint32_t MAGIC_ABORT_SR     = 0xCC1EAF01;
+static const uint32_t MAGIC_CONTINUE_ITER= 0x00000003;
 
 // ============================================================================
 // Network helpers
@@ -166,7 +163,7 @@ static void bcastU32(const vector<int>& fds, uint32_t v) { for (int fd : fds) se
 static void bcastD  (const vector<int>& fds, double   v) { for (int fd : fds) sendD  (fd, v); }
 
 // ============================================================================
-// Chebyshev coefficients for soft-threshold on [-R,R], input normalized by R
+// Chebyshev coefficients for soft-threshold on [-R,R]
 // ============================================================================
 static vector<double> chebyCoeffs(double R, int deg) {
     int M = deg + 1;
@@ -186,8 +183,7 @@ static vector<double> chebyCoeffs(double R, int deg) {
 }
 
 // ============================================================================
-// maskedDecryptSend: server masks enc_val with enc_r, broadcasts to all,
-// collects partial decrypt shares, fuses, sends plaintext only to targetId
+// maskedDecryptSend
 // ============================================================================
 static void maskedDecryptSend(
     int targetId,
@@ -209,28 +205,105 @@ static void maskedDecryptSend(
 }
 
 // ============================================================================
-// Data helpers (same seed formula as client.cpp)
+// Data helpers
 // ============================================================================
 using Mat = vector<vector<double>>;
 
-static void genData(int pid, Mat& Ai, vector<double>& bi) {
-    mt19937 rng(42 + pid * 1000);
-    normal_distribution<double> nd(0, 1), noise(0, 0.01);
-    uniform_real_distribution<double> ud(1, 2);
-    Ai.assign(M_ROWS, vector<double>(N_FEAT));
-    for (size_t j = 0; j < N_FEAT; j++) {
-        double nm = 0;
-        for (size_t i = 0; i < M_ROWS; i++) { Ai[i][j] = nd(rng); nm += Ai[i][j]*Ai[i][j]; }
-        nm = sqrt(nm);
-        for (size_t i = 0; i < M_ROWS; i++) Ai[i][j] /= nm;
+// Load full Riboflavin X and y (71 rows)
+static void loadRiboflavinFull(Mat& X, vector<double>& y) {
+    // Load X
+    ifstream fX("data/riboflavin_X.csv");
+    if (!fX.is_open()) throw runtime_error("Cannot open data/riboflavin_X.csv");
+    string line;
+    getline(fX, line);  // skip header
+    X.clear();
+    while (getline(fX, line)) {
+        istringstream ss(line);
+        string tok;
+        vector<double> row;
+        // skip row-name field if present (non-numeric first token)
+        bool firstToken = true;
+        while (getline(ss, tok, ',')) {
+            if (firstToken) {
+                firstToken = false;
+                // check if it looks like a number
+                bool isNum = !tok.empty() &&
+                             (isdigit((unsigned char)tok[0]) || tok[0]=='-' || tok[0]=='.');
+                if (!isNum) continue;  // skip row label
+            }
+            try { row.push_back(stod(tok)); } catch (...) {}
+        }
+        if (!row.empty()) X.push_back(row);
     }
-    vector<double> xt(N_FEAT, 0);
-    for (int k = 0; k < 10; k++) xt[k*(N_FEAT/10)] = ud(rng);
-    bi.resize(M_ROWS);
-    for (size_t i = 0; i < M_ROWS; i++) {
-        bi[i] = 0;
-        for (size_t j = 0; j < N_FEAT; j++) bi[i] += Ai[i][j]*xt[j];
-        bi[i] += noise(rng);
+    fX.close();
+    if ((int)X.size() != TOTAL_ROWS)
+        throw runtime_error("riboflavin_X.csv: expected " + to_string(TOTAL_ROWS) +
+                            " rows, got " + to_string(X.size()));
+
+    // Load y
+    ifstream fY("data/riboflavin_y.csv");
+    if (!fY.is_open()) throw runtime_error("Cannot open data/riboflavin_y.csv");
+    getline(fY, line);  // skip header
+    y.clear();
+    while (getline(fY, line)) {
+        istringstream ss(line);
+        string tok;
+        bool firstToken = true;
+        double val = 0;
+        bool gotVal = false;
+        while (getline(ss, tok, ',')) {
+            if (firstToken) {
+                firstToken = false;
+                bool isNum = !tok.empty() &&
+                             (isdigit((unsigned char)tok[0]) || tok[0]=='-' || tok[0]=='.');
+                if (!isNum) continue;
+            }
+            try { val = stod(tok); gotVal = true; break; } catch (...) {}
+        }
+        if (gotVal) y.push_back(val);
+    }
+    fY.close();
+    if ((int)y.size() != TOTAL_ROWS)
+        throw runtime_error("riboflavin_y.csv: expected " + to_string(TOTAL_ROWS) +
+                            " rows, got " + to_string(y.size()));
+}
+
+// Column-normalize X in-place (each column divided by its L2 norm)
+static void colNormalize(Mat& X) {
+    size_t nrows = X.size(), ncols = X[0].size();
+    for (size_t j = 0; j < ncols; j++) {
+        double nm = 0;
+        for (size_t i = 0; i < nrows; i++) nm += X[i][j] * X[i][j];
+        nm = sqrt(nm);
+        if (nm > 1e-12)
+            for (size_t i = 0; i < nrows; i++) X[i][j] /= nm;
+    }
+}
+
+// Center y (subtract mean)
+static void centerY(vector<double>& y) {
+    double mu = 0;
+    for (double v : y) mu += v;
+    mu /= y.size();
+    for (double& v : y) v -= mu;
+}
+
+// Load global (all 71 rows) after normalization
+static void loadGlobal(Mat& globalA, vector<double>& globalB) {
+    loadRiboflavinFull(globalA, globalB);
+    colNormalize(globalA);
+    centerY(globalB);
+}
+
+// Load partition for client pid (server uses same logic for generating v_i etc)
+static void loadPartition(int pid, Mat& Ai, vector<double>& bi,
+                           const Mat& globalA, const vector<double>& globalB) {
+    int r0 = CLIENT_ROW_START[pid];
+    int r1 = CLIENT_ROW_END[pid];
+    Ai.clear(); bi.clear();
+    for (int r = r0; r < r1; r++) {
+        Ai.push_back(globalA[r]);
+        bi.push_back(globalB[r]);
     }
 }
 
@@ -248,9 +321,18 @@ static double computeObjective(const vector<double>& z,
     return data + lambda_lasso * l1;
 }
 
-// ============================================================================
-// Matrix algebra helpers (same logic as client.cpp)
-// ============================================================================
+static double computeMSE(const vector<double>& z,
+                          const Mat& A, const vector<double>& b) {
+    double mse = 0.0;
+    size_t n = A.size();
+    for (size_t i = 0; i < n; i++) {
+        double Az = 0.0;
+        for (size_t j = 0; j < z.size(); j++) Az += A[i][j] * z[j];
+        double d = Az - b[i]; mse += d * d;
+    }
+    return mse / n;
+}
+
 static Mat transpose(const Mat& A) {
     size_t m = A.size(), n = A[0].size();
     Mat T(n, vector<double>(m));
@@ -340,12 +422,24 @@ int main(int argc, char* argv[]) {
     };
 
     netInit();
-    cout << "=== TRIAD Server (K=" << NUM_PARTIES << ")"
+    cout << "=== TRIAD Server (Riboflavin, K=" << NUM_PARTIES << ")"
          << (triadOnly ? " [TRIAD-ONLY]" : "") << " ===" << endl;
-    cout << "  lambda=" << lambda_lasso << " kappa=" << kappa
+    cout << "  N_FEAT=" << N_FEAT << " TOTAL_ROWS=" << TOTAL_ROWS
+         << " lambda=" << lambda_lasso << " kappa=" << kappa
          << " Lmin=" << Lmin_levels << endl;
 
-    vector<double> zPlain(N_FEAT, 0.0);  // filled by distributed plaintext ADMM below
+    // Load global dataset
+    cout << "\n[Data] Loading Riboflavin dataset..." << endl;
+    Mat globalA; vector<double> globalB;
+    loadGlobal(globalA, globalB);
+    cout << "  Loaded " << globalA.size() << " rows x " << globalA[0].size()
+         << " cols, y size=" << globalB.size() << " (t=" << elapsed() << "s)" << endl;
+
+    // Load per-client partitions (server needs them for PlainADMM and objective)
+    vector<Mat>           clientA(NUM_PARTIES);
+    vector<vector<double>> clientB(NUM_PARTIES);
+    for (int i = 0; i < NUM_PARTIES; i++)
+        loadPartition(i, clientA[i], clientB[i], globalA, globalB);
 
     // -----------------------------------------------------------------------
     // Phase 0: Load keys
@@ -379,12 +473,12 @@ int main(int argc, char* argv[]) {
          << " totalLevels=" << totalLevels
          << " (t=" << elapsed() << "s)" << endl;
 
-    Mat globalA; vector<double> globalB;
-    for (int pid = 0; pid < NUM_PARTIES; pid++) {
-        Mat Ai; vector<double> bi; genData(pid, Ai, bi);
-        for (auto& row : Ai) globalA.push_back(row);
-        for (double v : bi) globalB.push_back(v);
-    }
+    // Verify BatchSize is sufficient
+    if (cc->GetEncodingParams()->GetBatchSize() < N_FEAT)
+        throw runtime_error("BatchSize " +
+            to_string(cc->GetEncodingParams()->GetBatchSize()) +
+            " < N_FEAT " + to_string(N_FEAT) +
+            ". Regenerate keys with keygen_real.");
 
     // -----------------------------------------------------------------------
     // Connect
@@ -415,8 +509,11 @@ int main(int argc, char* argv[]) {
     cout << "  All clients ready (t=" << elapsed() << "s)" << endl;
 
     // -----------------------------------------------------------------------
-    // Distributed Plaintext ADMM baseline (Pi clients participate via network)
+    // Distributed Plaintext ADMM baseline
     // -----------------------------------------------------------------------
+    vector<double> zPlain(N_FEAT, 0.0);
+    double plainFinalObj = 0.0;
+
     if (!triadOnly) {
     cout << "\n[Plaintext ADMM] Starting distributed baseline..." << endl;
     bcastU32(fds, MAGIC_PLAIN_ADMM);
@@ -425,63 +522,53 @@ int main(int argc, char* argv[]) {
         vector<double> zP(N_FEAT, 0.0);
         vector<vector<double>> uP(NUM_PARTIES, vector<double>(N_FEAT, 0.0));
 
-        ofstream plog("plaintext_admm_log.csv");
-        plog << "iter,objective,elapsed_s\n";
+        ofstream plog("plaintext_admm_real_log.csv");
+        plog << "iter,objective,mse,elapsed_s\n";
 
         for (int iter = 0; iter < maxIter; iter++) {
-            // Send v_i = z - u_i to each client
             for (int i = 0; i < NUM_PARTIES; i++)
                 sendVec(fds[i], vecsub(zP, uP[i]));
 
-            // Receive x_i from each client
             vector<vector<double>> xP(NUM_PARTIES);
             for (int i = 0; i < NUM_PARTIES; i++)
                 xP[i] = recvVec(fds[i]);
 
-            // z-update: w = (1/K)*sum(x_i+u_i), z = softThresh(w, kappa)
             vector<double> w(N_FEAT, 0.0);
             for (int i = 0; i < NUM_PARTIES; i++)
                 w = vecadd(w, vecadd(xP[i], uP[i]));
-            // Diagnostic: track max|w/K| so we know the real range R should cover
             double maxW = 0.0;
             for (double v : w) maxW = max(maxW, fabs(v / NUM_PARTIES));
             zP = softThreshVec(vecscale(w, 1.0 / NUM_PARTIES), kappa);
 
-            // u_i update
             for (int i = 0; i < NUM_PARTIES; i++)
                 uP[i] = vecadd(uP[i], vecsub(xP[i], zP));
 
             double obj = computeObjective(zP, globalA, globalB);
+            double mse = computeMSE(zP, globalA, globalB);
             cout << "  [PlainADMM] iter=" << setw(2) << iter
                  << "  max|w|=" << fixed << setprecision(4) << maxW
                  << "  obj=" << fixed << setprecision(6) << obj
+                 << "  mse=" << fixed << setprecision(6) << mse
                  << "  t=" << fixed << setprecision(2) << elapsed() << "s" << endl;
-            plog << iter << "," << obj << "," << elapsed() << "\n";
+            plog << iter << "," << obj << "," << mse << "," << elapsed() << "\n";
             plog.flush();
         }
         plog.close();
         zPlain = zP;
-        cout << "[Plaintext ADMM] Done. Final obj="
-             << computeObjective(zPlain, globalA, globalB) << endl;
+        plainFinalObj = computeObjective(zPlain, globalA, globalB);
+        cout << "[Plaintext ADMM] Done. Final obj=" << plainFinalObj << endl;
     }
-    } // end if (!triadOnly) — PlainADMM
+    } // end if (!triadOnly)
 
     // -----------------------------------------------------------------------
-    // Static-R experiments (before TRIAD, for comparison)
-    // Protocol: bcast MAGIC_STATIC_R + R → run 50 iters (no CRC) → MAGIC_END
+    // Static-R = 2.0 experiment (for comparison with TRIAD)
     // -----------------------------------------------------------------------
-    struct SRResult { string label; double finalObj; bool exploded; };
-    vector<SRResult> srResults;
+    double staticR2FinalObj = std::numeric_limits<double>::quiet_NaN();
+    double staticR2FinalMSE = std::numeric_limits<double>::quiet_NaN();
     if (!triadOnly) {
-    srResults.push_back({"Plaintext_ADMM",
-                         computeObjective(zPlain, globalA, globalB), false});
-
-    const vector<double> staticRs = {0.5, 1.5, 2.0, 3.0, 5.0, 10.0};
-    for (double sr : staticRs) {
-        ostringstream oss; oss << fixed << setprecision(1) << sr;
-        string label = "StaticR_" + oss.str();
-        cout << "\n===== " << label << " =====" << endl;
-
+    {
+        const double sr = 2.0;
+        cout << "\n===== Static-R=" << sr << " =====" << endl;
         bcastU32(fds, MAGIC_STATIC_R);
         bcastD(fds, sr);
 
@@ -490,37 +577,31 @@ int main(int argc, char* argv[]) {
         vector<Ciphertext<DCRTPoly>> encUS(NUM_PARTIES);
         for (int i = 0; i < NUM_PARTIES; i++)
             encUS[i] = cc->Encrypt(jointPK, ptZ0);
-        double RS     = sr;
-        auto   coeffS = chebyCoeffs(RS, chebyDegree);
+        auto coeffS = chebyCoeffs(sr, chebyDegree);
 
-        string fname = label;
-        for (char& c : fname) if (!isalnum(c) && c != '_') c = '_';
-        ofstream slog(fname + "_log.csv");
-        slog << "iter,R,remLev,refresh,objective,elapsed_s\n";
+        ofstream slog("StaticR_2_0_real_log.csv");
+        slog << "iter,R,remLev,refresh,objective,mse,elapsed_s\n";
         bool exploded   = false;
-        bool abort_next = false;   // set when explosion/decrypt-fail detected
-        double prev_obj = -1.0;   // for relative-jump detection
+        bool abort_next = false;
+        double prev_obj = -1.0;
 
         for (int iter = 0; iter < maxIter; iter++) {
             bool did_ref = false;
             size_t remLev = totalLevels - encZS->GetLevel() - 1;
 
-            // ── Pre-iteration handshake: abort immediately or signal clients to continue ──
             if (abort_next) {
-                cout << "  [ABORT] " << label << " aborted at iter=" << iter
-                     << " — skipping remaining iterations" << endl;
+                cout << "  [ABORT] StaticR=2.0 aborted at iter=" << iter << endl;
                 bcastU32(fds, MAGIC_ABORT_SR);
-                slog << iter << "," << RS << "," << remLev
-                     << "," << 0 << ",ABORT," << elapsed() << "\n";
+                slog << iter << "," << sr << "," << remLev
+                     << "," << 0 << ",ABORT,ABORT," << elapsed() << "\n";
                 slog.flush();
                 break;
             }
             bcastU32(fds, MAGIC_CONTINUE_ITER);
 
             cout << "  iter=" << setw(2) << iter
-                 << "  R=" << RS << "  remLev=" << remLev
+                 << "  R=" << sr << "  remLev=" << remLev
                  << "  t=" << fixed << setprecision(1) << elapsed() << "s" << endl;
-            cout.flush();
 
             // a) recv masks
             vector<Ciphertext<DCRTPoly>> encRvS(NUM_PARTIES), encRuS(NUM_PARTIES);
@@ -528,47 +609,40 @@ int main(int argc, char* argv[]) {
                 encRvS[i] = recvObj<Ciphertext<DCRTPoly>>(fds[i], cc);
                 encRuS[i] = recvObj<Ciphertext<DCRTPoly>>(fds[i], cc);
             }
-            cout << "    [a] masks received" << endl; cout.flush();
 
-            // b) Phase A: all v masked-decrypts
+            // b) v masked-decrypts
             for (int i = 0; i < NUM_PARTIES; i++)
                 maskedDecryptSend(i, fds, cc->EvalSub(encZS, encUS[i]), encRvS[i], cc, N_FEAT);
-            cout << "    [b] v masked-decrypts done" << endl; cout.flush();
 
             // c) collect enc(x_i)
             vector<Ciphertext<DCRTPoly>> encXS(NUM_PARTIES);
             for (int i = 0; i < NUM_PARTIES; i++)
                 encXS[i] = recvObj<Ciphertext<DCRTPoly>>(fds[i], cc);
-            cout << "    [c] enc(x_i) collected" << endl; cout.flush();
 
-            // d) Phase C: all u masked-decrypts
+            // d) u masked-decrypts
             for (int i = 0; i < NUM_PARTIES; i++)
                 maskedDecryptSend(i, fds, encUS[i], encRuS[i], cc, N_FEAT);
-            cout << "    [d] u masked-decrypts done" << endl; cout.flush();
 
-            // e) enc(w) — NO CRC for Static-R
+            // e) enc(w)
             auto encWS = cc->EvalAdd(encXS[0], encUS[0]);
             for (int i = 1; i < NUM_PARTIES; i++)
                 encWS = cc->EvalAdd(encWS, cc->EvalAdd(encXS[i], encUS[i]));
             encWS = cc->EvalMult(encWS, 1.0 / NUM_PARTIES);
 
             // f) Chebyshev z-update with fixed R
-            cout << "    [f] EvalChebyshevSeries..." << endl; cout.flush();
             auto encZnewS = cc->EvalChebyshevSeries(
-                                cc->EvalMult(encWS, 1.0 / RS), coeffS, -1.0, 1.0);
+                                cc->EvalMult(encWS, 1.0 / sr), coeffS, -1.0, 1.0);
 
             // g) broadcast enc(z), collect enc(u_i)
             bcast(fds, encZnewS, cc);
             for (int i = 0; i < NUM_PARTIES; i++)
                 encUS[i] = recvObj<Ciphertext<DCRTPoly>>(fds[i], cc);
             encZS = encZnewS;
-            cout << "    [g] enc(z) broadcast, enc(u_i) collected" << endl; cout.flush();
 
             // h) Refresh or ITERDONE
             remLev = totalLevels - encZS->GetLevel() - 1;
             if ((int)remLev < Lmin_levels) {
                 did_ref = true;
-                cout << "    [h] Refresh (remLev=" << remLev << ")..." << endl; cout.flush();
                 bcastU32(fds, MAGIC_REFRESH);
                 bcast(fds, encZS, cc);
                 vector<Ciphertext<DCRTPoly>> zshS(NUM_PARTIES);
@@ -579,14 +653,12 @@ int main(int argc, char* argv[]) {
                 bcast(fds, encZS, cc);
                 for (int i = 0; i < NUM_PARTIES; i++)
                     encUS[i] = recvObj<Ciphertext<DCRTPoly>>(fds[i], cc);
-                cout << "    [h] Refresh done, remLev=" << (totalLevels-encZS->GetLevel()-1) << endl;
             } else {
                 bcastU32(fds, MAGIC_ITERDONE);
             }
 
             // i) side-decrypt for objective monitoring
-            double obj = -1.0;
-            bool step_failed = false;
+            double obj = -1.0, mse_s = -1.0;
             {
                 bcast(fds, encZS, cc);
                 vector<Ciphertext<DCRTPoly>> objShS(NUM_PARTIES);
@@ -596,77 +668,59 @@ int main(int argc, char* argv[]) {
                     Plaintext ptObjS; cc->MultipartyDecryptFusion(objShS, &ptObjS);
                     ptObjS->SetLength(N_FEAT);
                     auto zvecS = ptObjS->GetRealPackedValue(); zvecS.resize(N_FEAT);
-                    obj = computeObjective(zvecS, globalA, globalB);
+                    obj   = computeObjective(zvecS, globalA, globalB);
+                    mse_s = computeMSE(zvecS, globalA, globalB);
                     bool burst   = (prev_obj > 0.0 && obj > prev_obj * 100.0 && obj > 100.0);
                     bool abs_exp = (obj > 1e4);
                     bool nan_inf = (std::isnan(obj) || std::isinf(obj));
                     if (!exploded && (burst || abs_exp || nan_inf)) {
                         string reason = nan_inf ? "NaN/Inf" : (burst ? "100x_jump" : "obj>1e4");
-                        cout << "    [EXPLOSION] obj=" << obj
-                             << " prev=" << prev_obj
-                             << " reason=" << reason
-                             << " (R=" << sr << " too small)" << endl;
-                        exploded   = true;
-                        abort_next = true;   // abort at step-h of NEXT iteration
+                        cout << "    [EXPLOSION] obj=" << obj << " reason=" << reason << endl;
+                        exploded = true; abort_next = true;
                     } else {
-                        cout << "    obj=" << fixed << setprecision(6) << obj << endl;
+                        cout << "    obj=" << fixed << setprecision(6) << obj
+                             << "  mse=" << fixed << setprecision(6) << mse_s << endl;
                         prev_obj = obj;
                     }
                 } catch (...) {
-                    cout << "    [DECRYPT_FAIL] iter=" << iter
-                         << " — scheduling abort for " << label << endl;
-                    step_failed = true;
-                    abort_next  = true;
-                    exploded    = true;
+                    cout << "    [DECRYPT_FAIL] iter=" << iter << endl;
+                    abort_next = true; exploded = true;
                 }
             }
-            cout << "    [iter " << iter << " done] t=" << fixed << setprecision(1)
-                 << elapsed() << "s" << endl; cout.flush();
-            slog << iter << "," << RS << "," << (totalLevels-encZS->GetLevel()-1)
+            slog << iter << "," << sr << "," << (totalLevels-encZS->GetLevel()-1)
                  << "," << did_ref << ","
-                 << (step_failed ? "FAIL" : (obj < 0 ? "NaN" : to_string(obj)))
-                 << "," << elapsed() << "\n";
+                 << (obj<0?"NaN":to_string(obj)) << ","
+                 << (mse_s<0?"NaN":to_string(mse_s)) << ","
+                 << elapsed() << "\n";
             slog.flush();
         }
         slog.close();
-        // Final decrypt for this static-R run
-        cout << "  [FinalDecrypt] sending MAGIC_END, collecting shares..." << endl;
-        cout.flush();
+
+        // Final decrypt for Static-R=2.0
         bcastU32(fds, MAGIC_END);
         bcast(fds, encZS, cc);
-        cout << "  [FinalDecrypt] enc(z) sent, waiting for partial decrypts..." << endl;
-        cout.flush();
         vector<Ciphertext<DCRTPoly>> fshS(NUM_PARTIES);
-        for (int i = 0; i < NUM_PARTIES; i++) {
+        for (int i = 0; i < NUM_PARTIES; i++)
             fshS[i] = recvObj<Ciphertext<DCRTPoly>>(fds[i], cc);
-            cout << "  [FinalDecrypt] got partial from client " << i
-                 << "  t=" << fixed << setprecision(1) << elapsed() << "s" << endl;
-            cout.flush();
-        }
-        cout << "  [FinalDecrypt] fusing..." << endl; cout.flush();
-        double finalObjS = std::numeric_limits<double>::quiet_NaN();
         try {
             Plaintext ptFS; cc->MultipartyDecryptFusion(fshS, &ptFS);
             ptFS->SetLength(N_FEAT);
-            auto zFS = ptFS->GetRealPackedValue();
+            auto zFS = ptFS->GetRealPackedValue(); zFS.resize(N_FEAT);
             for (int i = 0; i < NUM_PARTIES; i++) sendVec(fds[i], zFS);
-            finalObjS = computeObjective(zFS, globalA, globalB);
-            cout << "  Final obj=" << finalObjS;
+            staticR2FinalObj = computeObjective(zFS, globalA, globalB);
+            staticR2FinalMSE = computeMSE(zFS, globalA, globalB);
+            cout << "  StaticR=2.0 final obj=" << staticR2FinalObj
+                 << " mse=" << staticR2FinalMSE << endl;
         } catch (...) {
-            cout << "  [FINAL_DECRYPT_FAIL] decryption failed for " << label
-                 << " — sending zero vec to keep sync" << endl;
+            cout << "  [FINAL_DECRYPT_FAIL] StaticR=2.0" << endl;
             vector<double> zeroVec(N_FEAT, 0.0);
             for (int i = 0; i < NUM_PARTIES; i++) sendVec(fds[i], zeroVec);
-            exploded = true;
         }
-        if (exploded) cout << "  [EXPLODED]";
-        cout << "\n  t=" << elapsed() << "s" << endl;
-        srResults.push_back({label, finalObjS, exploded});
     }
-    } // end if (!triadOnly) — Static-R
+    } // end if (!triadOnly) — Static-R=2.0
 
     // -----------------------------------------------------------------------
-    // Signal TRIAD start — client proceeds to Phase 1
+    // Signal TRIAD start
     // -----------------------------------------------------------------------
     bcastU32(fds, MAGIC_TRIAD_START);
     cout << "  MAGIC_TRIAD_START sent (t=" << elapsed() << "s)" << endl;
@@ -709,19 +763,17 @@ int main(int argc, char* argv[]) {
     // -----------------------------------------------------------------------
     // Phase 2: ADMM iterations
     // -----------------------------------------------------------------------
-    cout << "\n[Phase 2] Running " << maxIter << " iterations "
-         << "(Lmin=" << Lmin_levels << " totalLev=" << totalLevels << ")..." << endl;
+    cout << "\n[Phase 2] Running " << maxIter << " iterations..." << endl;
 
-    ofstream log("Adaptive_TRIAD_log.csv");
-    log << "iter,R,remLev,crc,refresh,objective,elapsed_s\n";
-    ofstream tlog("timing_log.csv");
+    ofstream log("Adaptive_TRIAD_real_log.csv");
+    log << "iter,R,remLev,crc,refresh,objective,mse,elapsed_s\n";
+    ofstream tlog("timing_real_log.csv");
     tlog << "iter,t_mask_ms,t_vdecrypt_ms,t_xcollect_ms,t_udecrypt_ms,t_wupdate_ms"
             ",t_crc_ms,t_cheby_ms,t_broadcast_ms,t_refresh_ms,t_sidedecrypt_ms,t_total_ms\n";
 
-    // R-adaptation history (Bootstrap-R + each CRC update)
     struct REvent { int iter; double oldR; double R_raw; double newR; double Psi; bool safeAll; };
     vector<REvent> rHistory;
-    rHistory.push_back({-1, 0.0, 0.0, currentR, 0.0, true});  // Bootstrap-R initial value
+    rHistory.push_back({-1, 0.0, 0.0, currentR, 0.0, true});
 
     using hrc = chrono::high_resolution_clock;
     auto hms = [](hrc::time_point a, hrc::time_point b) {
@@ -790,7 +842,7 @@ int main(int argc, char* argv[]) {
             if (R_raw > currentR) {
                 currentR = R_raw;
             } else if (!safeAll) {
-                currentR = currentR / delta_safe;  // 主动扩张：w已接近边界，反推安全R
+                currentR = currentR / delta_safe;
             } else if (iter > shrinkWarmup && safeAll) {
                 currentR = max(R_raw, gamma_smooth * currentR);
             }
@@ -836,7 +888,7 @@ int main(int argc, char* argv[]) {
         auto tp_i = hrc::now();
 
         // j) side-decrypt for objective monitoring
-        double obj = -1.0;
+        double obj = -1.0, mse_t = -1.0;
         {
             bcast(fds, encZ, cc);
             vector<Ciphertext<DCRTPoly>> objSh(NUM_PARTIES);
@@ -846,8 +898,10 @@ int main(int argc, char* argv[]) {
                 Plaintext ptObj; cc->MultipartyDecryptFusion(objSh, &ptObj);
                 ptObj->SetLength(N_FEAT);
                 auto zvec = ptObj->GetRealPackedValue(); zvec.resize(N_FEAT);
-                obj = computeObjective(zvec, globalA, globalB);
-                cout << "    obj=" << fixed << setprecision(6) << obj << endl;
+                obj   = computeObjective(zvec, globalA, globalB);
+                mse_t = computeMSE(zvec, globalA, globalB);
+                cout << "    obj=" << fixed << setprecision(6) << obj
+                     << "  mse=" << fixed << setprecision(6) << mse_t << endl;
             } catch (...) { cout << "    obj=N/A" << endl; }
         }
         auto tp_j = hrc::now();
@@ -879,7 +933,8 @@ int main(int argc, char* argv[]) {
         log << iter << "," << currentR << ","
             << (totalLevels-encZ->GetLevel()-1) << ","
             << did_crc << "," << did_ref << ","
-            << (obj<0?"NaN":to_string(obj)) << "," << elapsed() << "\n";
+            << (obj<0?"NaN":to_string(obj)) << ","
+            << (mse_t<0?"NaN":to_string(mse_t)) << "," << elapsed() << "\n";
         log.flush();
         tlog << iter << fixed << setprecision(3)
              << "," << dt_mask << "," << dt_vdecrypt << "," << dt_xcollect
@@ -903,92 +958,62 @@ int main(int argc, char* argv[]) {
     auto zF = ptF->GetRealPackedValue();
     for (int i = 0; i < NUM_PARTIES; i++) sendVec(fds[i], zF);
 
-    cout << "Final z[0..9]:";
-    for (int i = 0; i < 10; i++) cout << " " << fixed << setprecision(4) << zF[i];
-    cout << "\nFinal objective: " << computeObjective(zF, globalA, globalB) << endl;
+    double triadFinalObj = computeObjective(zF, globalA, globalB);
+    cout << "Final objective (TRIAD): " << triadFinalObj << endl;
     cout << "Total time: " << elapsed() << "s" << endl;
 
     // -----------------------------------------------------------------------
-    // Results summary — three separate tables
+    // Results summary
     // -----------------------------------------------------------------------
-    srResults.push_back({"Adaptive_TRIAD", computeObjective(zF, globalA, globalB), false});
-
-    // ── Table 1: Objective function (all algorithms) ─────────────────────────
     cout << "\n============================================================" << endl;
-    cout << " Table 1: Objective Function Comparison (all algorithms)" << endl;
+    cout << " Objective Comparison: PlainADMM vs Adaptive TRIAD (Riboflavin)" << endl;
     cout << "============================================================" << endl;
     cout << left << setw(26) << "Algorithm"
-         << right << setw(16) << "Final Objective"
-         << "  Status" << endl;
-    cout << string(55, '-') << endl;
-    for (auto& r : srResults) {
-        cout << left << setw(26) << r.label
-             << right << setw(16) << fixed << setprecision(6) << r.finalObj;
-        if (r.exploded) cout << "  [EXPLODED]";
-        cout << "\n";
-    }
+         << right << setw(18) << "Final Objective" << endl;
+    cout << string(46, '-') << endl;
+    if (!triadOnly)
+        cout << left << setw(26) << "Plaintext_ADMM"
+             << right << setw(18) << fixed << setprecision(6) << plainFinalObj << "\n";
+    cout << left << setw(26) << "Adaptive_TRIAD"
+         << right << setw(18) << fixed << setprecision(6) << triadFinalObj << "\n";
     cout << "============================================================" << endl;
-    cout << "  Logs: plaintext_admm_log.csv  StaticR_*_log.csv  Adaptive_TRIAD_log.csv" << endl;
 
-    // ── Table 2: Latency breakdown (TRIAD / Adaptive only) ───────────────────
+    // Latency breakdown
     {
         int N = (int)v_t_total.size();
         if (N > 0) {
             auto mean_v = [&](const vector<double>& v) {
                 double s = 0; for (double x : v) s += x; return s / v.size();
             };
-            double mu_mask   = mean_v(v_t_mask),   mu_vdec = mean_v(v_t_vdecrypt),
-                   mu_xcol   = mean_v(v_t_xcollect),mu_udec = mean_v(v_t_udecrypt),
-                   mu_wup    = mean_v(v_t_wupdate), mu_crc  = mean_v(v_t_crc),
-                   mu_cheby  = mean_v(v_t_cheby),   mu_bcast= mean_v(v_t_broadcast),
-                   mu_ref    = mean_v(v_t_refresh),  mu_side= mean_v(v_t_sidedecrypt),
-                   mu_total  = mean_v(v_t_total);
-
+            double mu_total = mean_v(v_t_total);
             cout << "\n============================================================" << endl;
-            cout << " Table 2: Per-Iteration Latency Breakdown (Adaptive TRIAD)" << endl;
-            cout << "  (" << N << " iterations, all times in ms)" << endl;
+            cout << " Per-Iteration Latency (Adaptive TRIAD, Riboflavin)" << endl;
+            cout << "  (" << N << " iterations, times in ms)" << endl;
             cout << "============================================================" << endl;
-            cout << left << setw(22) << "Step"
-                 << right << setw(12) << "Mean (ms)" << endl;
-            cout << string(36, '-') << endl;
             auto row = [&](const char* name, double mu) {
-                cout << left << setw(22) << name
-                     << right << setw(12) << fixed << setprecision(2) << mu << "\n";
+                cout << left << setw(24) << name
+                     << right << setw(10) << fixed << setprecision(2) << mu << " ms\n";
             };
-            row("(a) recv_masks",      mu_mask);
-            row("(b) v_masked_decrypt",mu_vdec);
-            row("(c) x_collect",       mu_xcol);
-            row("(d) u_masked_decrypt",mu_udec);
-            row("(e) w_update",        mu_wup);
-            row("(f) CRC",             mu_crc);
-            row("(g) Chebyshev",       mu_cheby);
-            row("(h) broadcast_z+u",   mu_bcast);
-            row("(i) refresh",         mu_ref);
-            row("(j) side_decrypt",    mu_side);
+            row("(a) recv_masks",       mean_v(v_t_mask));
+            row("(b) v_masked_decrypt", mean_v(v_t_vdecrypt));
+            row("(c) x_collect",        mean_v(v_t_xcollect));
+            row("(d) u_masked_decrypt", mean_v(v_t_udecrypt));
+            row("(e) w_update",         mean_v(v_t_wupdate));
+            row("(f) CRC",              mean_v(v_t_crc));
+            row("(g) Chebyshev",        mean_v(v_t_cheby));
+            row("(h) broadcast_z+u",    mean_v(v_t_broadcast));
+            row("(i) refresh",          mean_v(v_t_refresh));
+            row("(j) side_decrypt",     mean_v(v_t_sidedecrypt));
             cout << string(36, '-') << endl;
-            row("TOTAL",               mu_total);
-            cout << "============================================================" << endl;
-
-            // ── Table 3: Throughput ───────────────────────────────────────────
-            double mean_total_s = mu_total / 1000.0;
-            double throughput   = (mean_total_s > 0) ? (double)N_FEAT / mean_total_s : 0.0;
-            cout << "\n============================================================" << endl;
-            cout << " Table 3: Throughput (Adaptive TRIAD)" << endl;
-            cout << "============================================================" << endl;
-            cout << left << setw(30) << "Mean iteration time"
-                 << right << setw(10) << fixed << setprecision(2) << mu_total << " ms\n";
-            cout << left << setw(30) << "N_FEAT"
-                 << right << setw(10) << N_FEAT << "\n";
-            cout << left << setw(30) << "Throughput"
-                 << right << setw(10) << fixed << setprecision(2) << throughput << " features/s\n";
+            row("TOTAL",                mu_total);
             cout << "============================================================" << endl;
         }
     }
 
-    // ── Table 4: R adaptation history (Adaptive TRIAD) ───────────────────────
+    // R adaptation history
     {
         cout << "\n============================================================" << endl;
-        cout << " Table 4: R Adaptation History (Adaptive TRIAD)" << endl;
+        cout << " R Adaptation History (Adaptive TRIAD, Riboflavin)" << endl;
         cout << "============================================================" << endl;
         cout << right << setw(6)  << "iter"
              << setw(10) << "oldR"
@@ -1001,12 +1026,9 @@ int main(int argc, char* argv[]) {
         for (auto& e : rHistory) {
             if (e.iter == -1) {
                 cout << right << setw(6)  << "init"
-                     << setw(10) << fixed << setprecision(4) << e.oldR
-                     << setw(10) << "-"
                      << setw(10) << fixed << setprecision(4) << e.newR
-                     << setw(12) << "-"
-                     << setw(10) << "-"
-                     << setw(7)  << "-" << "\n";
+                     << setw(10) << "-" << setw(10) << fixed << setprecision(4) << e.newR
+                     << setw(12) << "-" << setw(10) << "-" << setw(7) << "-" << "\n";
             } else {
                 cout << right << setw(6)  << e.iter
                      << setw(10) << fixed << setprecision(4) << e.oldR

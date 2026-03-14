@@ -1,91 +1,237 @@
-# TRIAD Deployment Guide
+# Distributed Lasso via Multi-Key Homomorphic Encryption (TRIAD)
 
-## Architecture
+A privacy-preserving distributed LASSO solver using threshold CKKS homomorphic encryption, implemented with [OpenFHE](https://github.com/openfheorg/openfhe-development) v1.5.0.
+
+## Overview
+
+**TRIAD** (Threshold-based Range-adaptive Iterative ADMM under encryption) solves the federated LASSO problem:
+
+$$\min_{z} \frac{1}{2}\|Az - b\|^2 + \lambda \|z\|_1$$
+
+where the data matrix $A$ and labels $b$ are horizontally partitioned across $K$ clients. The server never sees plaintext client data; all x-updates happen under CKKS encryption with multiparty decryption.
+
+### Key Features
+
+- **Threshold CKKS**: 3-party joint key generation; no single party can decrypt alone
+- **Adaptive Chebyshev soft-threshold (CRC)**: range parameter $R$ adapts online via a Chebyshev Range Check, avoiding numerical explosion
+- **Woodbury identity**: client-side x-update uses $(m_i \times m_i)$ matrix inversion instead of $(p \times p)$, enabling large feature dimensions
+- **Bootstrap-refresh**: ciphertext level management with full multiparty re-encryption when levels drop below threshold
+
+---
+
+## Repository Structure
 
 ```
-[Main Machine - Server]
-        |
-   +---------+---------+
-   |         |         |
-[Pi 0]    [Pi 1]    [Pi 2]
-party_0   party_1   party_2
-port 9000 port 9001 port 9002
+.
+├── keygen.cpp            # Key generation for synthetic experiment
+├── server.cpp            # TRIAD server — synthetic dataset
+├── client.cpp            # TRIAD client — synthetic dataset
+├── plot_convergence.py   # Convergence plot (PlainADMM / Static-R / TRIAD)
+├── plot_time.py          # Per-iteration latency breakdown plot
+├── sparsity_analysis.py  # Sparsity sensitivity analysis script
+├── cMakelists.txt        # CMake build (server/client, Windows)
+├── CMakeLists_pi.txt     # CMake build (client, Raspberry Pi)
+│
+└── solve_real/           # Riboflavin real-data experiment (71×4088)
+    ├── keygen_real.cpp       # Key generation (BatchSize=8192 for N=4088)
+    ├── server_real.cpp       # TRIAD server — Riboflavin dataset
+    ├── client_real.cpp       # TRIAD client — Riboflavin dataset
+    ├── plot_convergence_real.py  # Convergence plot for real-data experiment
+    └── CMakeLists.txt        # CMake build (-Wa,-mbig-obj for MinGW)
 ```
 
-## Build
+---
+
+## System Architecture
+
+```
+[Windows Server]
+       |
+  +---------+---------+
+  |         |         |
+[Pi 0]   [Pi 1]   [Pi 2]
+party_0  party_1  party_2
+port 10000 10001  10002
+```
+
+- Server: Windows x86-64, runs key aggregation + ADMM z-update (Chebyshev)
+- Clients: Raspberry Pi (ARM), each holds a private data partition + secret key share
+
+---
+
+## Dependencies
+
+| Component | Version |
+|-----------|---------|
+| OpenFHE   | v1.5.0  |
+| CMake     | ≥ 3.16  |
+| Compiler  | MinGW-w64 (Windows) / GCC (Pi) |
+| Python    | ≥ 3.8 (for plotting) |
+
+Python packages: `numpy pandas matplotlib`
+
+---
+
+## Experiment 1 — Synthetic Dataset (`solve/`)
+
+**Problem**: $n=100$ samples, $p=200$ features, 3 clients (rows split evenly), ground-truth $x^*$ with 10% sparsity. $\lambda = 0.1$.
+
+### Build (Windows server)
 
 ```bash
 mkdir build && cd build
-cmake ..
-make -j4
+cmake .. -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
+mingw32-make -j4
 ```
 
-On Raspberry Pi (cross-compile or build on Pi directly):
+### Build (Raspberry Pi clients)
+
+```bash
+mkdir build && cd build
+cmake .. -f ../CMakeLists_pi.txt -DCMAKE_BUILD_TYPE=Release
+make -j2
+```
+
+### Key Generation
+
+```bash
+# On server
+cd build && ./keygen.exe
+# Distribute keys/ to all 3 Pis:
+scp -r keys/ huang@<Pi0_IP>:~/client/build/
+scp -r keys/ huang@<Pi1_IP>:~/client/build/
+scp -r keys/ huang@<Pi2_IP>:~/client/build/
+```
+
+### Run
+
+```bash
+# Start clients first (one terminal per Pi)
+ssh huang@<Pi0_IP> "cd ~/client/build && ./client 0"
+ssh huang@<Pi1_IP> "cd ~/client/build && ./client 1"
+ssh huang@<Pi2_IP> "cd ~/client/build && ./client 2"
+
+# Once all clients show "Listening...", start server
+cd build && ./server.exe
+```
+
+Optional flag `--triad-only` skips the PlainADMM baseline.
+
+### Plot
+
+```bash
+python plot_convergence.py   # reads build/*.csv, outputs figures/
+```
+
+---
+
+## Experiment 2 — Riboflavin Real Dataset (`solve_real/`)
+
+**Problem**: Riboflavin production dataset, $n=71$ samples, $p=4088$ genes, 3 clients (rows 0–23, 24–47, 48–70). $\lambda = 0.01$.
+
+Data preprocessing: column-wise L2 normalization on $X$, mean-centering on $y$ (applied identically on server and all clients).
+
+### Build (Windows server)
+
+```bash
+cd solve_real
+mkdir build && cd build
+cmake .. -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
+mingw32-make -j4
+```
+
+### Build (Raspberry Pi clients)
+
 ```bash
 mkdir build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
-make -j4   # use -j2 if Pi runs out of memory during compile
+make -j2
 ```
 
-## Run
+### Data Setup
 
-### 1. Start server first (on main machine)
+Place in `build/data/`:
+```
+data/
+  riboflavin_X.csv   # 71 × 4088, header row, comma-separated
+  riboflavin_y.csv   # 71 × 1,    header row, comma-separated
+```
+
+The Riboflavin dataset is from the R package `hdi` (`riboflavin`). To export:
+
+```R
+library(hdi)
+data(riboflavin)
+write.csv(t(riboflavin$x), "riboflavin_X.csv")
+write.csv(riboflavin$y,    "riboflavin_y.csv")
+```
+
+### Key Generation
+
+BatchSize must be ≥ 4088; `keygen_real` uses BatchSize=8192.
+
 ```bash
-./server
+cd build && ./keygen_real.exe
+scp -r keys/ huang@<Pi0_IP>:~/client_real/build/
+scp -r keys/ huang@<Pi1_IP>:~/client_real/build/
+scp -r keys/ huang@<Pi2_IP>:~/client_real/build/
 ```
-Server will block waiting for all 3 clients to connect.
 
-### 2. Start each client (on each Raspberry Pi)
+### Run
+
 ```bash
-# Pi 0
-./client 0 <server_ip>
+# Start clients first
+ssh huang@<Pi0_IP> "cd ~/client_real/build && pkill -f client_real; ./client_real 0"
+ssh huang@<Pi1_IP> "cd ~/client_real/build && pkill -f client_real; ./client_real 1"
+ssh huang@<Pi2_IP> "cd ~/client_real/build && pkill -f client_real; ./client_real 2"
 
-# Pi 1
-./client 1 <server_ip>
-
-# Pi 2
-./client 2 <server_ip>
+# Once all show "Listening...", start server
+cd solve_real/build && ./server_real.exe
 ```
 
-Start all 3 clients within a few seconds of each other.
+Output logs (in `build/`):
+- `plaintext_admm_real_log.csv` — PlainADMM baseline (100 iterations)
+- `Adaptive_TRIAD_real_log.csv` — TRIAD with CRC (100 iterations)
+- `timing_real_log.csv` — per-step latency breakdown
 
-## Protocol Phases
+### Plot
 
-### Phase 0 - Key Setup
-1. Server generates party-0 keypair
-2. Broadcasts party-0 public key to all clients
-3. Client 1 and 2 generate chained keys, send public+secret keys to server
-4. Server builds joint public key + eval keys
-5. Broadcasts joint public key to all clients
+```bash
+cd solve_real && python plot_convergence_real.py
+# Output: solve_real/figures/triad_real_convergence.{pdf,png}
+```
 
-### Phase 1 - Initial R Bootstrap
-1. Each client computes x_i^(0) = (A_i^T A_i + rhoI)^{-1} A_i^T b_i
-2. Encrypts with joint public key, sends enc(x_i^(0)) to server
-3. Server aggregates, computes ||x^(0)||_2 via CRC, sets R = 1.5 * ||x^(0)||_2
-4. Broadcasts initial R to all clients
+---
 
-### Phase 2 - ADMM-CRC Iterations (50 rounds)
+## Protocol Details
+
+### Phase 0 — Threshold Key Setup
+Multiparty CKKS key generation (OpenFHE threshold API):
+1. Party 0 generates initial key pair
+2. Parties 1 & 2 contribute chained key pairs
+3. Joint public key + eval mult/rot/sum keys are assembled and broadcast
+
+### Phase 1 — Bootstrap R
+Each client encrypts $x_i^{(0)} = (A_i^\top A_i + \rho I)^{-1} A_i^\top b_i$ (computed via Woodbury identity for large $p$).
+Server aggregates → computes $\|\bar{x}^{(0)}\|_2$ via multiparty inner product decryption → sets initial $R$.
+
+### Phase 2 — ADMM Iterations with CRC
 Each iteration:
-1. Server computes enc(z-u), sends to all clients
-2. Clients partially decrypt z-u, server fuses -> plaintext z-u
-3. Each client computes x_i update locally
-4. Each client encrypts x_i, sends enc(x_i) to server
-5. Server aggregates enc(x), computes enc(w) = enc(x) + enc(u)
-6. Every 5 iters (after warmup): CRC computes ||w||_2 and ||w||_4,
-   adaptively shrinks R if safe
-7. Server runs EvalChebyshev on enc(w) -> enc(z)
-8. Server refreshes if needed (level < threshold)
-9. Server updates enc(u) = enc(u) + enc(x) - enc(z)
-10. Server broadcasts updated R + iter-done signal
+1. Server sends masked $\text{enc}(z - u_i)$ for client x-update
+2. Client returns $\text{enc}(x_i)$
+3. Server computes $\text{enc}(w) = \frac{1}{K}\sum_i \text{enc}(x_i + u_i)$
+4. **CRC** (every 5 iters after warmup): decrypt $\|w\|^2$ → update $R$ adaptively
+5. Server applies Chebyshev soft-threshold: $z \leftarrow S_\kappa^{(R)}(w)$
+6. Refresh if remaining levels < threshold
+7. Side-decrypt for objective monitoring
 
-## Output Files (server-side)
-- `triad_convergence.csv`: iteration, objective, R history, CRC/refresh events
+### Phase 3 — Final Result
+Multiparty decryption of final $\text{enc}(z)$.
+
+---
 
 ## Notes
-- Party 0 key is generated server-side in simulation mode.
-  For fully distributed deployment, remove server-side party-0 key gen
-  and have Pi 0 send its public key first.
-- The server holds all secret key shares in simulation mode (honest server).
-  For production, use threshold decryption so no single party holds all shares.
-- Partial decrypt protocol: each client sends its partial to server,
-  server fuses. This is implemented in client.cpp Step 1.
+
+- Secret key shares are **never** sent to the server; multiparty decryption uses partial decryption shares only
+- The CRC prevents Chebyshev approximation failure by keeping $w/R \in [-1, 1]$
+- `--triad-only` flag skips PlainADMM baseline (useful when re-running only TRIAD)
