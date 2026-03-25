@@ -30,15 +30,23 @@ target_link_libraries(keygen OPENFHEpke)
 add_executable(server server.cpp)
 add_executable(client client.cpp)
 
+# sparsity sensitivity experiment
+add_executable(server_sparsity server_sparsity.cpp)
+add_executable(client_sparsity client_sparsity.cpp)
+
 if(WIN32)
     target_link_libraries(keygen OPENFHEpke)
     target_link_libraries(server OPENFHEpke ws2_32)
     target_link_libraries(client OPENFHEpke ws2_32)
+    target_link_libraries(server_sparsity OPENFHEpke ws2_32)
+    target_link_libraries(client_sparsity OPENFHEpke ws2_32)
 else()
     target_link_libraries(keygen OPENFHEpke OPENFHEcore OPENFHEbinfhe)
     target_link_libraries(server OPENFHEpke OPENFHEcore OPENFHEbinfhe)
     target_link_libraries(client OPENFHEpke OPENFHEcore OPENFHEbinfhe)
-    foreach(tgt keygen server client)
+    target_link_libraries(server_sparsity OPENFHEpke OPENFHEcore OPENFHEbinfhe)
+    target_link_libraries(client_sparsity OPENFHEpke OPENFHEcore OPENFHEbinfhe)
+    foreach(tgt keygen server client server_sparsity client_sparsity)
         target_link_options(${tgt} PRIVATE
             -Wl,--whole-archive
             /usr/local/lib/libOPENFHEpke.so

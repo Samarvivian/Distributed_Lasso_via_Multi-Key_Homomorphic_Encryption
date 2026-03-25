@@ -18,7 +18,7 @@ COLORS = {
     'Computation': '#4C72B0',  # 深蓝
     'Communication': '#DD8452',  # 橙色
     'Decryption': '#55A868',  # 绿色
-    'CRC (Ours)': '#C44E52'  # 红色 (突出显示)
+    'CRC': '#C44E52'  # 红色 (突出显示)
 }
 
 
@@ -39,7 +39,7 @@ def plot_latency_breakdown(csv_path):
     # 联合解密/刷新类：t_vdecrypt, t_udecrypt
     df['Decryption'] = df['t_vdecrypt_ms'] + df['t_udecrypt_ms']
     # 你的核心贡献
-    df['CRC (Ours)'] = df['t_crc_ms']
+    df['CRC'] = df['t_crc_ms']
 
     # 只取前 50 轮或感兴趣的样本
     plot_df = df.head(50)
@@ -48,7 +48,7 @@ def plot_latency_breakdown(csv_path):
     # 3. 绘图
     fig, ax = plt.subplots(figsize=(12, 6))
 
-    categories = ['Computation', 'Communication', 'Decryption', 'CRC (Ours)']
+    categories = ['Computation', 'Communication', 'Decryption', 'CRC']
     bottom = np.zeros(len(plot_df))
 
     for cat in categories:

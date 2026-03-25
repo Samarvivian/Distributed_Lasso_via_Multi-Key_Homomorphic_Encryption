@@ -257,7 +257,7 @@ def main():
         res = plot_series(ax, iters, obj,
                           color=COLORS['crc'], marker='^',  # Triangle up (original)
                           lw=2.5, ms=7,
-                          label='Adaptive TRIAD (Ours)', zorder=5)
+                          label='Consensus-based Range Calibration (CRC)', zorder=5)
         if res:
             x, y, di = res
             divergence_annotations.append(
@@ -325,25 +325,25 @@ def main():
             ha = 'right'
 
         # Clamp within y-axis bounds
-        y_text = max(ylim[0] * 1.05, min(y_text, ylim[1] * 0.9))  # Increased bottom margin
+        y_text = max(ylim[0] * 1.05, min(y_text, ylim[1] * 0.82))
 
         # Shorter arrow with less shrink
         ax.annotate(text,
                     xy=(x, y),
                     xytext=(x_text, y_text),
-                    fontsize=9, color='#222222', fontweight='bold',
+                    fontsize=11, color='#222222', fontweight='bold',
                     ha=ha,
                     arrowprops=dict(arrowstyle='->',
                                     color=color,
-                                    lw=1.0,  # Slightly thinner arrow
-                                    shrinkA=5,  # Increased from 0 to create gap from point
-                                    shrinkB=5,  # Increased from 3 to create gap from text
-                                    connectionstyle='arc3,rad=0.1'),  # Slight curve
-                    bbox=dict(boxstyle='round,pad=0.2',  # Smaller padding
+                                    lw=1.5,
+                                    shrinkA=6,
+                                    shrinkB=6,
+                                    connectionstyle='arc3,rad=0.1'),
+                    bbox=dict(boxstyle='round,pad=0.4',
                               facecolor='#FFFDE7',
                               edgecolor=color,
                               alpha=0.95,
-                              linewidth=1.0),  # Thinner border
+                              linewidth=1.5),
                     zorder=20)
 
     # ------------------------------------------------------------------

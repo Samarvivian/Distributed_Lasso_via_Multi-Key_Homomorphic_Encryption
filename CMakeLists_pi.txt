@@ -33,3 +33,13 @@ target_link_options(client PRIVATE
     -Wl,--whole-archive
     /usr/local/lib/libOPENFHEpke.so
     -Wl,--no-whole-archive)
+
+add_executable(client_sparsity client_sparsity.cpp)
+target_link_libraries(client_sparsity OPENFHEpke OPENFHEcore OPENFHEbinfhe)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(client_sparsity OpenMP::OpenMP_CXX)
+endif()
+target_link_options(client_sparsity PRIVATE
+    -Wl,--whole-archive
+    /usr/local/lib/libOPENFHEpke.so
+    -Wl,--no-whole-archive)

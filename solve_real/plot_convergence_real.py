@@ -160,20 +160,20 @@ def annotate_divergences(ax, divergence_annotations, n_iter_total=100):
         else:
             x_text, ha = x - n_iter_total * 0.02, 'right'
 
-        y_text = max(ylim[0] * 1.05, min(y_text, ylim[1] * 0.9))
+        y_text = max(ylim[0] * 1.05, min(y_text, ylim[1] * 0.82))
 
         ax.annotate(text,
                     xy=(x, y),
                     xytext=(x_text, y_text),
-                    fontsize=9, color='#222222', fontweight='bold',
+                    fontsize=11, color='#222222', fontweight='bold',
                     ha=ha,
                     arrowprops=dict(arrowstyle='->',
-                                    color=color, lw=1.0,
-                                    shrinkA=5, shrinkB=5,
+                                    color=color, lw=1.5,
+                                    shrinkA=6, shrinkB=6,
                                     connectionstyle='arc3,rad=0.1'),
-                    bbox=dict(boxstyle='round,pad=0.2',
+                    bbox=dict(boxstyle='round,pad=0.4',
                               facecolor='#FFFDE7', edgecolor=color,
-                              alpha=0.95, linewidth=1.0),
+                              alpha=0.95, linewidth=1.5),
                     zorder=20)
 
 

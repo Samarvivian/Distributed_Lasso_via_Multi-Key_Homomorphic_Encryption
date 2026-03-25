@@ -496,7 +496,7 @@ int main(int argc, char* argv[]) {
         string fname = label;
         for (char& c : fname) if (!isalnum(c) && c != '_') c = '_';
         ofstream slog(fname + "_log.csv");
-        slog << "iter,R,remLev,refresh,objective,elapsed_s\n";
+        slog << "iter,R,remLev,refresh,objective,mem_used_MB,elapsed_s\n";
         bool exploded   = false;
         bool abort_next = false;   // set when explosion/decrypt-fail detected
         double prev_obj = -1.0;   // for relative-jump detection
@@ -620,11 +620,16 @@ int main(int argc, char* argv[]) {
                     exploded    = true;
                 }
             }
+            // collect mem_used_MB from each Pi
+            double avg_memS = 0.0;
+            for (int i = 0; i < NUM_PARTIES; i++) avg_memS += recvD(fds[i]);
+            avg_memS /= NUM_PARTIES;
             cout << "    [iter " << iter << " done] t=" << fixed << setprecision(1)
                  << elapsed() << "s" << endl; cout.flush();
             slog << iter << "," << RS << "," << (totalLevels-encZS->GetLevel()-1)
                  << "," << did_ref << ","
                  << (step_failed ? "FAIL" : (obj < 0 ? "NaN" : to_string(obj)))
+                 << "," << fixed << setprecision(2) << avg_memS
                  << "," << elapsed() << "\n";
             slog.flush();
         }
@@ -713,7 +718,7 @@ int main(int argc, char* argv[]) {
          << "(Lmin=" << Lmin_levels << " totalLev=" << totalLevels << ")..." << endl;
 
     ofstream log("Adaptive_TRIAD_log.csv");
-    log << "iter,R,remLev,crc,refresh,objective,elapsed_s\n";
+    log << "iter,R,remLev,crc,refresh,objective,mse,cpu_temp_C,mem_used_MB,net_bytes,cpu_freq_MHz,elapsed_s\n";
     ofstream tlog("timing_log.csv");
     tlog << "iter,t_mask_ms,t_vdecrypt_ms,t_xcollect_ms,t_udecrypt_ms,t_wupdate_ms"
             ",t_crc_ms,t_cheby_ms,t_broadcast_ms,t_refresh_ms,t_sidedecrypt_ms,t_total_ms\n";
@@ -836,7 +841,7 @@ int main(int argc, char* argv[]) {
         auto tp_i = hrc::now();
 
         // j) side-decrypt for objective monitoring
-        double obj = -1.0;
+        double obj = -1.0, mse = -1.0;
         {
             bcast(fds, encZ, cc);
             vector<Ciphertext<DCRTPoly>> objSh(NUM_PARTIES);
@@ -847,9 +852,27 @@ int main(int argc, char* argv[]) {
                 ptObj->SetLength(N_FEAT);
                 auto zvec = ptObj->GetRealPackedValue(); zvec.resize(N_FEAT);
                 obj = computeObjective(zvec, globalA, globalB);
-                cout << "    obj=" << fixed << setprecision(6) << obj << endl;
+                mse = 0.0;
+                for (size_t i = 0; i < globalA.size(); i++) {
+                    double Az = 0.0;
+                    for (size_t j = 0; j < N_FEAT; j++) Az += globalA[i][j]*zvec[j];
+                    double di = Az - globalB[i]; mse += di*di;
+                }
+                mse = sqrt(mse / globalA.size());
+                cout << "    obj=" << fixed << setprecision(6) << obj
+                     << "  mse=" << mse << endl;
             } catch (...) { cout << "    obj=N/A" << endl; }
         }
+        // j2) Collect per-iteration system metrics from Pi clients
+        double avg_temp = 0.0, avg_mem = 0.0, avg_net = 0.0, avg_freq = 0.0;
+        for (int i = 0; i < NUM_PARTIES; i++) {
+            avg_temp += recvD(fds[i]);
+            avg_mem  += recvD(fds[i]);
+            avg_net  += recvD(fds[i]);
+            avg_freq += recvD(fds[i]);
+        }
+        avg_temp /= NUM_PARTIES; avg_mem /= NUM_PARTIES;
+        avg_net  /= NUM_PARTIES; avg_freq /= NUM_PARTIES;
         auto tp_j = hrc::now();
 
         double dt_mask       = hms(tp_start, tp_a);
@@ -879,7 +902,12 @@ int main(int argc, char* argv[]) {
         log << iter << "," << currentR << ","
             << (totalLevels-encZ->GetLevel()-1) << ","
             << did_crc << "," << did_ref << ","
-            << (obj<0?"NaN":to_string(obj)) << "," << elapsed() << "\n";
+            << (obj<0?"NaN":to_string(obj)) << ","
+            << (mse<0?"NaN":to_string(mse)) << ","
+            << fixed << setprecision(2)
+            << avg_temp << "," << avg_mem << ","
+            << avg_net  << "," << avg_freq << ","
+            << elapsed() << "\n";
         log.flush();
         tlog << iter << fixed << setprecision(3)
              << "," << dt_mask << "," << dt_vdecrypt << "," << dt_xcollect

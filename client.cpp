@@ -451,6 +451,22 @@ int main(int argc, char* argv[]) {
                     else           partObjS = cc->MultipartyDecryptMain({encZobjS}, mySK)[0];
                     sendObj(fd, partObjS, cc);
                 }
+                // i2) Send mem_used_MB
+                {
+                    double mem_used = 0.0;
+#if defined(__linux__)
+                    {
+                        ifstream f("/proc/meminfo"); string line;
+                        long total=0, avail=0;
+                        while(getline(f,line)) {
+                            if(line.rfind("MemTotal:",0)==0)  sscanf(line.c_str(),"MemTotal: %ld",&total);
+                            if(line.rfind("MemAvailable:",0)==0) sscanf(line.c_str(),"MemAvailable: %ld",&avail);
+                        }
+                        mem_used = (total-avail)/1024.0;
+                    }
+#endif
+                    sendD(fd, mem_used);
+                }
             }
 
             // Final decrypt for this static-R run
@@ -615,6 +631,51 @@ int main(int argc, char* argv[]) {
             if (myId == 0) partObj = cc->MultipartyDecryptLead({encZobj}, mySK)[0];
             else           partObj = cc->MultipartyDecryptMain({encZobj}, mySK)[0];
             sendObj(fd, partObj, cc);
+        }
+        // i2) Send system metrics: cpu_temp_C, mem_used_MB, net_bytes, cpu_freq_MHz
+        {
+            // CPU temperature
+            double cpu_temp = 0.0;
+#if defined(__linux__)
+            { ifstream f("/sys/class/thermal/thermal_zone0/temp"); int t=0; if(f>>t) cpu_temp=t/1000.0; }
+#endif
+            // Memory used (MB)
+            double mem_used = 0.0;
+#if defined(__linux__)
+            {
+                ifstream f("/proc/meminfo"); string line;
+                long total=0, avail=0;
+                while(getline(f,line)) {
+                    if(line.rfind("MemTotal:",0)==0)  sscanf(line.c_str(),"MemTotal: %ld",&total);
+                    if(line.rfind("MemAvailable:",0)==0) sscanf(line.c_str(),"MemAvailable: %ld",&avail);
+                }
+                mem_used = (total-avail)/1024.0;
+            }
+#endif
+            // Network bytes (RX+TX on all interfaces except lo)
+            double net_bytes = 0.0;
+#if defined(__linux__)
+            {
+                ifstream f("/proc/net/dev"); string line;
+                getline(f,line); getline(f,line); // skip 2 header lines
+                while(getline(f,line)) {
+                    string iface; istringstream ss(line);
+                    ss>>iface; if(iface=="lo:") continue;
+                    long long rx=0,tx=0,tmp;
+                    ss>>rx>>tmp>>tmp>>tmp>>tmp>>tmp>>tmp>>tmp>>tx;
+                    net_bytes += rx+tx;
+                }
+            }
+#endif
+            // CPU frequency (MHz)
+            double cpu_freq = 0.0;
+#if defined(__linux__)
+            { ifstream f("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq"); long hz=0; if(f>>hz) cpu_freq=hz/1000.0; }
+#endif
+            sendD(fd, cpu_temp);
+            sendD(fd, mem_used);
+            sendD(fd, net_bytes);
+            sendD(fd, cpu_freq);
         }
 
         cout << "    [iter " << iter << " done] t=" << fixed << setprecision(1)
