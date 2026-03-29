@@ -32,6 +32,12 @@
  * Protocol signals added:
  *   MAGIC_DO_U_DECRYPT   (0x00000006) — server tells clients: decrypt u this iter
  *   MAGIC_SKIP_U_DECRYPT (0x00000007) — server tells clients: skip u decrypt
+ *
+ * CRC timing breakdown (NEW):
+ *   t_crc_innerprod_ms  — EvalInnerProduct on server
+ *   t_crc_bcast_ms      — broadcast ct_Psi to all clients
+ *   t_crc_pardecrypt_ms — collect partial decrypt shares + MultipartyDecryptFusion
+ *   t_crc_rraw_ms       — broadcast R_raw + collect safeAll votes
  */
 
 #include "openfhe/pke/openfhe.h"
@@ -89,16 +95,12 @@ static const double delta_safe     = 0.95;
 static const int    Lmin_levels    = 6;
 static const double kappa          = lambda_lasso / (rho * NUM_PARTIES);
 
-// How many levels does one Chebyshev call consume?
-// deg=13 → ceil(log2(13+1))=4 squarings + a few mults ≈ 8 levels consumed.
-// We pre-trigger u-decrypt one iteration before remLev would drop below Lmin.
-static const int    REFRESH_LOOKAHEAD = 1;   // trigger u-decrypt this many iters before refresh
+static const int    REFRESH_LOOKAHEAD = 1;
 
-// Pi deployment IPs — set all to "127.0.0.1" for local mode
 static const char* CLIENT_IPS[3] = {
-    "192.168.186.223",
-    "192.168.186.33",
-    "192.168.186.214"
+    "192.168.182.223",
+    "192.168.182.33",
+    "192.168.182.214"
 };
 
 static const uint32_t MAGIC_READY         = 0xCAFEBABE;
@@ -114,8 +116,8 @@ static const uint32_t MAGIC_ABORT_SR      = 0xCC1EAF01;
 static const uint32_t MAGIC_CONTINUE_ITER = 0x00000003;
 static const uint32_t MAGIC_DO_MONITOR    = 0x00000004;
 static const uint32_t MAGIC_SKIP_MONITOR  = 0x00000005;
-static const uint32_t MAGIC_DO_U_DECRYPT  = 0x00000006;  // NEW: lazy u-decrypt signal
-static const uint32_t MAGIC_SKIP_U_DECRYPT= 0x00000007;  // NEW: skip u-decrypt signal
+static const uint32_t MAGIC_DO_U_DECRYPT  = 0x00000006;
+static const uint32_t MAGIC_SKIP_U_DECRYPT= 0x00000007;
 
 static const int SIDE_DECRYPT_INTERVAL    = 5;
 
@@ -204,8 +206,7 @@ static vector<double> chebyCoeffs(double R, int deg) {
 }
 
 // ============================================================================
-// maskedDecryptSend: server masks enc_val with enc_r, broadcasts to all,
-// collects partial decrypt shares, fuses, sends plaintext only to targetId
+// maskedDecryptSend
 // ============================================================================
 static void maskedDecryptSend(
     int targetId,
@@ -227,7 +228,7 @@ static void maskedDecryptSend(
 }
 
 // ============================================================================
-// Data helpers (same seed formula as client.cpp)
+// Data helpers
 // ============================================================================
 using Mat = vector<vector<double>>;
 
@@ -480,7 +481,7 @@ int main(int argc, char* argv[]) {
     } // end PlainADMM
 
     // -----------------------------------------------------------------------
-    // Static-R experiments (disabled — loop body is skipped via continue)
+    // Static-R experiments (disabled)
     // -----------------------------------------------------------------------
     struct SRResult { string label; double finalObj; bool exploded; };
     vector<SRResult> srResults;
@@ -490,7 +491,7 @@ int main(int argc, char* argv[]) {
 
     const vector<double> staticRs = {0.5, 1.5, 2.0, 3.0, 5.0, 10.0};
     for (double sr : staticRs) {
-        (void)sr; continue; // Static-R disabled
+        (void)sr; continue;
     }
     } // end Static-R
 
@@ -544,10 +545,14 @@ int main(int argc, char* argv[]) {
     ofstream log("Adaptive_TRIAD_log.csv");
     log << "iter,R,remLev,crc,refresh,u_decrypt,objective,mse,"
            "cpu_temp_C,mem_used_MB,net_MBps_client,cpu_freq_MHz,elapsed_s\n";
+
+    // ── timing_log: 新增4列CRC子步骤 ────────────────────────────────────────
     ofstream tlog("timing_log.csv");
     tlog << "iter,t_mask_ms,t_vdecrypt_ms,t_xcollect_ms,t_udecrypt_ms,t_wupdate_ms"
             ",t_crc_ms,t_cheby_ms,t_broadcast_ms,t_refresh_ms,t_sidedecrypt_ms,t_total_ms"
-            ",t_compute_ms,t_comm_normal_ms,t_comm_crc_ms,t_wait_ms,crc_overhead_pct\n";
+            ",t_compute_ms,t_comm_normal_ms,t_comm_crc_ms,t_wait_ms,crc_overhead_pct"
+            // NEW: CRC内部子步骤
+            ",t_crc_innerprod_ms,t_crc_bcast_ms,t_crc_pardecrypt_ms,t_crc_rraw_ms\n";
 
     struct REvent { int iter; double oldR; double R_raw; double newR; double Psi; bool safeAll; };
     vector<REvent> rHistory;
@@ -561,15 +566,9 @@ int main(int argc, char* argv[]) {
                    v_t_wupdate, v_t_crc, v_t_cheby, v_t_broadcast,
                    v_t_refresh, v_t_sidedecrypt, v_t_total;
 
-    // Client needs ui plaintext only when a Refresh is about to happen.
-    // We predict refresh by checking if remLev after this iter's Chebyshev
-    // will fall below Lmin_levels. Since we know chebyDegree, we can estimate
-    // how many levels the next EvalChebyshevSeries will consume and pre-send
-    // u REFRESH_LOOKAHEAD iterations ahead.
-    //
-    // Simpler and robust approach: send u decrypt whenever
-    //   remLev - cheby_cost <= Lmin_levels + REFRESH_LOOKAHEAD
-    // where cheby_cost is estimated conservatively as ceil(log2(chebyDegree+1))*2.
+    // NEW: 累积CRC子步骤耗时（仅CRC触发轮）
+    vector<double> v_t_crc_innerprod, v_t_crc_bcast, v_t_crc_pardecrypt, v_t_crc_rraw;
+
     const int cheby_level_cost = 2 * (int)ceil(log2((double)(chebyDegree + 1)));
     cout << "  Estimated Chebyshev level cost per iter: " << cheby_level_cost << endl;
 
@@ -583,24 +582,10 @@ int main(int argc, char* argv[]) {
              << "  t=" << fixed << setprecision(1) << elapsed() << "s" << endl;
         cout.flush();
 
-        // ── Decide whether to do u-decrypt this iteration ──────────────────
-        // We need ui plaintext BEFORE the Refresh call in step (i).
-        // A Refresh fires when remLev (after Chebyshev) < Lmin_levels.
-        // remLev after Chebyshev ≈ remLevels - cheby_level_cost.
-        // So fire u-decrypt whenever that predicted value is within
-        // REFRESH_LOOKAHEAD of Lmin_levels, i.e.:
-        //   remLevels - cheby_level_cost <= Lmin_levels + REFRESH_LOOKAHEAD
         bool need_u_decrypt = ((int)remLevels - cheby_level_cost
                                 <= Lmin_levels + REFRESH_LOOKAHEAD);
 
-        // Also always do u-decrypt on iter 0 so clients have initial ui=0
-        // confirmed (not strictly necessary since ui starts at 0, but safe).
-        // Uncomment if you want extra safety:
-        // need_u_decrypt |= (iter == 0);
-
-        // a) recv masks from all clients
-        // Clients always send both enc(r_v) and enc(r_u).
-        // Server only uses enc(r_u) when need_u_decrypt is true.
+        // a) recv masks
         vector<Ciphertext<DCRTPoly>> encRv(NUM_PARTIES), encRu(NUM_PARTIES);
         for (int i = 0; i < NUM_PARTIES; i++) {
             encRv[i] = recvObj<Ciphertext<DCRTPoly>>(fds[i], cc);
@@ -608,7 +593,7 @@ int main(int argc, char* argv[]) {
         }
         auto tp_a = hrc::now();
 
-        // b) masked decrypt ALL v_i  (always required for x-update)
+        // b) masked decrypt v_i
         for (int i = 0; i < NUM_PARTIES; i++)
             maskedDecryptSend(i, fds, cc->EvalSub(encZ, encU[i]), encRv[i], cc, N_FEAT);
         auto tp_b = hrc::now();
@@ -619,8 +604,7 @@ int main(int argc, char* argv[]) {
             encX[i] = recvObj<Ciphertext<DCRTPoly>>(fds[i], cc);
         auto tp_c = hrc::now();
 
-        // d) LAZY u-decrypt: only when a Refresh is imminent
-        //    Signal clients first so they know whether to expect the decrypt.
+        // d) lazy u-decrypt
         if (need_u_decrypt) {
             did_u_decrypt = true;
             bcastU32(fds, MAGIC_DO_U_DECRYPT);
@@ -629,31 +613,53 @@ int main(int argc, char* argv[]) {
             cout << "    [d] u masked-decrypts done (pre-refresh)" << endl;
         } else {
             bcastU32(fds, MAGIC_SKIP_U_DECRYPT);
-            // enc(r_u) that clients sent are discarded — no RTT spent.
         }
         auto tp_d = hrc::now();
 
-        // e) enc(w) = (1/K)*sum(enc(x_i)+enc(u_i))
+        // e) enc(w)
         auto encW = cc->EvalAdd(encX[0], encU[0]);
         for (int i = 1; i < NUM_PARTIES; i++)
             encW = cc->EvalAdd(encW, cc->EvalAdd(encX[i], encU[i]));
         encW = cc->EvalMult(encW, 1.0 / NUM_PARTIES);
         auto tp_e = hrc::now();
 
-        // f) CRC
+        // ── f) CRC — 内部子步骤计时 ─────────────────────────────────────────
+        // 用NaN标记未触发轮次，写日志时区分
+        double dt_crc_innerprod = 0.0, dt_crc_bcast = 0.0,
+               dt_crc_pardecrypt = 0.0, dt_crc_rraw = 0.0;
+
         if (iter >= shrinkWarmup && iter % updateInterval == 0) {
             did_crc = true;
+
+            // f-1: 服务器本地EvalInnerProduct
+            auto tp_f1 = hrc::now();
             auto ct_Psi = cc->EvalInnerProduct(encW, encW, N_FEAT);
+            auto tp_f2 = hrc::now();
+            dt_crc_innerprod = hms(tp_f1, tp_f2);
+
+            // f-2: 广播ct_Psi给所有客户端
             bcast(fds, ct_Psi, cc);
+            auto tp_f3 = hrc::now();
+            dt_crc_bcast = hms(tp_f2, tp_f3);
+
+            // f-3: 收各方部分解密份额 + fusion（含网络等待+Pi计算）
             vector<Ciphertext<DCRTPoly>> psh(NUM_PARTIES);
             for (int i = 0; i < NUM_PARTIES; i++)
                 psh[i] = recvObj<Ciphertext<DCRTPoly>>(fds[i], cc);
             Plaintext ptP; cc->MultipartyDecryptFusion(psh, &ptP); ptP->SetLength(1);
-            double Psi   = max(0.0, ptP->GetRealPackedValue()[0]);
+            double Psi = max(0.0, ptP->GetRealPackedValue()[0]);
+            auto tp_f4 = hrc::now();
+            dt_crc_pardecrypt = hms(tp_f3, tp_f4);
+
+            // f-4: 广播R_raw + 收safeAll投票
             double R_raw = alpha_crc * sqrt(Psi / N_FEAT);
             bcastD(fds, R_raw);
             bool safeAll = true;
             for (int i = 0; i < NUM_PARTIES; i++) safeAll &= recvBool(fds[i]);
+            auto tp_f5 = hrc::now();
+            dt_crc_rraw = hms(tp_f4, tp_f5);
+
+            // R更新逻辑（不变）
             double oldR = currentR;
             if (R_raw > currentR) {
                 currentR = R_raw;
@@ -664,9 +670,20 @@ int main(int argc, char* argv[]) {
             }
             coeffs = chebyCoeffs(currentR, chebyDegree);
             rHistory.push_back({iter, oldR, R_raw, currentR, Psi, safeAll});
+
             cout << "    CRC Psi=" << Psi << " R_raw=" << R_raw
                  << " R=" << currentR << " safe=" << safeAll
                  << " dR=" << (currentR-oldR) << endl;
+            cout << "    CRC breakdown: innerprod=" << fixed << setprecision(1)
+                 << dt_crc_innerprod << "ms  bcast=" << dt_crc_bcast
+                 << "ms  pardecrypt=" << dt_crc_pardecrypt
+                 << "ms  rraw=" << dt_crc_rraw << "ms" << endl;
+
+            // 仅CRC触发轮才push
+            v_t_crc_innerprod.push_back(dt_crc_innerprod);
+            v_t_crc_bcast.push_back(dt_crc_bcast);
+            v_t_crc_pardecrypt.push_back(dt_crc_pardecrypt);
+            v_t_crc_rraw.push_back(dt_crc_rraw);
         }
         auto tp_f = hrc::now();
 
@@ -703,7 +720,7 @@ int main(int argc, char* argv[]) {
         }
         auto tp_i = hrc::now();
 
-        // j) side-decrypt for objective monitoring (sparse)
+        // j) side-decrypt
         double obj = -1.0, mse = -1.0;
         bool do_monitor = (iter % SIDE_DECRYPT_INTERVAL == 0) || (iter == maxIter - 1);
         if (do_monitor) {
@@ -731,7 +748,7 @@ int main(int argc, char* argv[]) {
             bcastU32(fds, MAGIC_SKIP_MONITOR);
         }
 
-        // j2) Collect per-iteration system metrics from Pi clients
+        // j2) system metrics
         double avg_temp = 0.0, avg_mem = 0.0, avg_net_MBps = 0.0, avg_freq = 0.0;
         for (int i = 0; i < NUM_PARTIES; i++) {
             avg_temp += recvD(fds[i]);
@@ -777,44 +794,63 @@ int main(int argc, char* argv[]) {
             << avg_net_MBps << "," << avg_freq << ","
             << elapsed() << "\n";
         log.flush();
+
         double comm_normal_ms = dt_mask + dt_xcollect + dt_broadcast;
         double comm_crc_ms    = did_crc ? dt_crc : 0.0;
         double comp_ms        = dt_wupdate + dt_cheby;
         double wait_ms        = dt_vdecrypt + dt_udecrypt + dt_refresh + dt_sidedecrypt;
         double crc_pct        = dt_total > 0.0 ? 100.0 * comm_crc_ms / dt_total : 0.0;
 
+        // CRC子步骤：未触发轮次写-1以便后处理时过滤
         tlog << iter << fixed << setprecision(3)
              << "," << dt_mask << "," << dt_vdecrypt << "," << dt_xcollect
              << "," << dt_udecrypt << "," << dt_wupdate << "," << dt_crc
              << "," << dt_cheby << "," << dt_broadcast << "," << dt_refresh
              << "," << dt_sidedecrypt << "," << dt_total
              << "," << comp_ms << "," << comm_normal_ms << "," << comm_crc_ms
-             << "," << wait_ms << "," << setprecision(2) << crc_pct << "\n";
+             << "," << wait_ms << "," << setprecision(2) << crc_pct
+             // NEW columns: -1 means CRC not triggered this iter
+             << "," << fixed << setprecision(3)
+             << (did_crc ? dt_crc_innerprod  : -1.0)
+             << "," << (did_crc ? dt_crc_bcast      : -1.0)
+             << "," << (did_crc ? dt_crc_pardecrypt  : -1.0)
+             << "," << (did_crc ? dt_crc_rraw        : -1.0)
+             << "\n";
         tlog.flush();
 
-        // ── Latency breakdown snapshot at iter 20, 30, 40 ──────────────────
+        // latency snapshot
         if (iter == 20 || iter == 30 || iter == 40) {
             cout << "\n  ┌─── Latency Snapshot @ iter=" << iter
                  << " (total=" << fixed << setprecision(1) << dt_total << " ms) ───┐" << endl;
-            cout << "  │  Compute   (encW+Cheby)         : " << setw(8) << fixed << setprecision(1)
+            cout << "  │  Compute   (encW+Cheby)          : " << setw(8) << fixed << setprecision(1)
                  << comp_ms << " ms  (" << setw(5) << fixed << setprecision(1)
                  << 100.0*comp_ms/dt_total << "%)" << endl;
-            cout << "  │  Comm-norm (masks+xcollect+bcast): " << setw(8) << fixed << setprecision(1)
+            cout << "  │  Comm-norm (masks+xcollect+bcast) : " << setw(8) << fixed << setprecision(1)
                  << comm_normal_ms << " ms  (" << setw(5) << fixed << setprecision(1)
                  << 100.0*comm_normal_ms/dt_total << "%)" << endl;
-            cout << "  │  Comm-CRC  (extra CRC round-trip): " << setw(8) << fixed << setprecision(1)
+            cout << "  │  Comm-CRC  (extra CRC round-trip) : " << setw(8) << fixed << setprecision(1)
                  << comm_crc_ms << " ms  (" << setw(5) << fixed << setprecision(2)
                  << crc_pct << "%)  <-- CRC overhead" << endl;
-            cout << "  │  Wait      (decrypt+refresh+side): " << setw(8) << fixed << setprecision(1)
+            if (did_crc) {
+                cout << "  │    ├ innerprod (server HE)        : " << setw(8) << fixed << setprecision(1)
+                     << dt_crc_innerprod << " ms" << endl;
+                cout << "  │    ├ bcast ct_Psi                 : " << setw(8) << fixed << setprecision(1)
+                     << dt_crc_bcast << " ms" << endl;
+                cout << "  │    ├ pardecrypt+fusion (Pi wait)  : " << setw(8) << fixed << setprecision(1)
+                     << dt_crc_pardecrypt << " ms" << endl;
+                cout << "  │    └ bcast R_raw + safeAll        : " << setw(8) << fixed << setprecision(1)
+                     << dt_crc_rraw << " ms" << endl;
+            }
+            cout << "  │  Wait      (decrypt+refresh+side) : " << setw(8) << fixed << setprecision(1)
                  << wait_ms << " ms  (" << setw(5) << fixed << setprecision(1)
                  << 100.0*wait_ms/dt_total << "%)" << endl;
-            cout << "  │    ├ v-masked-decrypt            : " << setw(8) << fixed << setprecision(1)
+            cout << "  │    ├ v-masked-decrypt              : " << setw(8) << fixed << setprecision(1)
                  << dt_vdecrypt << " ms" << endl;
-            cout << "  │    ├ u-masked-decrypt            : " << setw(8) << fixed << setprecision(1)
+            cout << "  │    ├ u-masked-decrypt              : " << setw(8) << fixed << setprecision(1)
                  << dt_udecrypt << " ms" << endl;
-            cout << "  │    ├ Refresh                     : " << setw(8) << fixed << setprecision(1)
+            cout << "  │    ├ Refresh                       : " << setw(8) << fixed << setprecision(1)
                  << dt_refresh << " ms" << endl;
-            cout << "  │    └ Side-decrypt                : " << setw(8) << fixed << setprecision(1)
+            cout << "  │    └ Side-decrypt                  : " << setw(8) << fixed << setprecision(1)
                  << dt_sidedecrypt << " ms" << endl;
             cout << "  └─────────────────────────────────────────────────────────────┘" << endl;
         }
@@ -841,7 +877,7 @@ int main(int argc, char* argv[]) {
 
     srResults.push_back({"Adaptive_TRIAD", computeObjective(zF, globalA, globalB), false});
 
-    // ── Table 1: Objective function ──────────────────────────────────────────
+    // ── Table 1: Objective ──────────────────────────────────────────────────
     cout << "\n============================================================" << endl;
     cout << " Table 1: Objective Function Comparison" << endl;
     cout << "============================================================" << endl;
@@ -857,7 +893,7 @@ int main(int argc, char* argv[]) {
     }
     cout << "============================================================" << endl;
 
-    // ── Table 2: Latency breakdown ───────────────────────────────────────────
+    // ── Table 2: Per-iteration latency ──────────────────────────────────────
     {
         int N = (int)v_t_total.size();
         if (N > 0) {
@@ -875,26 +911,59 @@ int main(int argc, char* argv[]) {
             cout << " Table 2: Per-Iteration Latency Breakdown (Adaptive TRIAD)" << endl;
             cout << "  (" << N << " iterations, all times in ms)" << endl;
             cout << "============================================================" << endl;
-            cout << left << setw(22) << "Step"
+            cout << left << setw(26) << "Step"
                  << right << setw(12) << "Mean (ms)" << endl;
-            cout << string(36, '-') << endl;
+            cout << string(40, '-') << endl;
             auto row = [&](const char* name, double mu) {
-                cout << left << setw(22) << name
+                cout << left << setw(26) << name
                      << right << setw(12) << fixed << setprecision(2) << mu << "\n";
             };
-            row("(a) recv_masks",       mu_mask);
-            row("(b) v_masked_decrypt", mu_vdec);
-            row("(c) x_collect",        mu_xcol);
-            row("(d) u_decrypt(lazy)",  mu_udec);
-            row("(e) w_update",         mu_wup);
-            row("(f) CRC",              mu_crc);
-            row("(g) Chebyshev",        mu_cheby);
-            row("(h) broadcast_z+u",    mu_bcast);
-            row("(i) refresh",          mu_ref);
-            row("(j) side_decrypt",     mu_side);
-            cout << string(36, '-') << endl;
-            row("TOTAL",                mu_total);
+            row("(a) recv_masks",         mu_mask);
+            row("(b) v_masked_decrypt",   mu_vdec);
+            row("(c) x_collect",          mu_xcol);
+            row("(d) u_decrypt(lazy)",    mu_udec);
+            row("(e) w_update",           mu_wup);
+            row("(f) CRC (total)",        mu_crc);
+            row("(g) Chebyshev",          mu_cheby);
+            row("(h) broadcast_z+u",      mu_bcast);
+            row("(i) refresh",            mu_ref);
+            row("(j) side_decrypt",       mu_side);
+            cout << string(40, '-') << endl;
+            row("TOTAL",                  mu_total);
             cout << "============================================================" << endl;
+
+            // ── CRC子步骤汇总（仅触发轮） ──────────────────────────────────
+            if (!v_t_crc_innerprod.empty()) {
+                int Ncrc = (int)v_t_crc_innerprod.size();
+                double mu_ip  = mean_v(v_t_crc_innerprod);
+                double mu_bc  = mean_v(v_t_crc_bcast);
+                double mu_pd  = mean_v(v_t_crc_pardecrypt);
+                double mu_rr  = mean_v(v_t_crc_rraw);
+                double mu_sum = mu_ip + mu_bc + mu_pd + mu_rr;
+
+                cout << "\n============================================================" << endl;
+                cout << " Table 2b: CRC Internal Breakdown (triggered iters only, n="
+                     << Ncrc << ")" << endl;
+                cout << "============================================================" << endl;
+                cout << left << setw(36) << "Sub-step"
+                     << right << setw(10) << "Mean(ms)"
+                     << setw(8) << "% CRC" << endl;
+                cout << string(56, '-') << endl;
+                auto crow = [&](const char* name, double mu) {
+                    cout << left << setw(36) << name
+                         << right << setw(10) << fixed << setprecision(2) << mu
+                         << setw(7) << fixed << setprecision(1)
+                         << (mu_sum>0 ? 100.0*mu/mu_sum : 0.0) << "%" << "\n";
+                };
+                crow("(f-1) EvalInnerProduct (server)",  mu_ip);
+                crow("(f-2) bcast ct_Psi to clients",    mu_bc);
+                crow("(f-3) Pi pardecrypt + fusion",     mu_pd);
+                crow("(f-4) bcast R_raw + safeAll vote", mu_rr);
+                cout << string(56, '-') << endl;
+                crow("CRC total",                        mu_sum);
+                cout << "============================================================" << endl;
+                cout << "  Note: (f-3) Pi pardecrypt dominates — ARM compute + WiFi RTT\n";
+            }
 
             double mean_total_s = mu_total / 1000.0;
             double throughput   = (mean_total_s > 0) ? (double)N_FEAT / mean_total_s : 0.0;

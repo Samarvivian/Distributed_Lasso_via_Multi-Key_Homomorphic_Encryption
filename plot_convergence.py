@@ -250,18 +250,14 @@ def main():
     # ------------------------------------------------------------------
     # 3) Adaptive TRIAD - original marker (triangle up)
     # ------------------------------------------------------------------
-    df = load_csv('Adaptive_TRIAD_log.csv')
+    df = load_csv('crc_objective.csv')
     if df is not None:
         iters = df['iter'].values
         obj = parse_obj_col(df['objective'])
         res = plot_series(ax, iters, obj,
                           color=COLORS['crc'], marker='^',  # Triangle up (original)
                           lw=2.5, ms=7,
-                          label='Consensus-based Range Calibration (CRC)', zorder=5)
-        if res:
-            x, y, di = res
-            divergence_annotations.append(
-                (x, y, f'iter {di}, diverged', COLORS['crc']))
+                          label='self-adaptive mechanism', zorder=5)
         fin = obj[~np.isnan(obj)]
         last_str = f'{fin[-1]:.4f}' if len(fin) > 0 else 'N/A'
         print(f"  Adaptive TRIAD: {len(iters)} iters, "

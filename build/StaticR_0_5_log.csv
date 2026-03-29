@@ -1,4 +1,4 @@
-iter,R,remLev,refresh,objective,elapsed_s
-0,0.5,9,0,17.603468,136.432
-1,0.5,15,1,155301.309784,247.698
-2,0.5,15,0,ABORT,247.705
+iter,R,remLev,refresh,objective,mem_used_MB,elapsed_s
+0,0.5,10,0,17.468128,603.06,148.05
+1,0.50,15,1,6516.423263,615.16,267.60
+2,0.50,15,0,ABORT,267.61
