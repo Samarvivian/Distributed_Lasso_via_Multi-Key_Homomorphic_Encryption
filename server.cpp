@@ -21,10 +21,17 @@
  * NUM_PARTIES = 3
  * Server does NOT hold any secret key.
  *
- * FIXES vs previous version:
- *   - lambda_lasso = 0.1  (was 1.0 in server.cpp — caused obj~1e14)
- *   - Lmin_levels  = 6    (was 3  — triggered Refresh too late, noise overflow)
- *   - R^(0) floor  = 5.0  (was missing — near-zero R breaks Cheby approximation)
+ * OPTIMIZATIONS vs previous version:
+ *   - Lazy u-decrypt: step (d) maskedDecryptSend for u_i is now skipped in
+ *     most iterations. It only fires in the iteration immediately before a
+ *     Refresh, so clients can rebuild their plaintext ui for re-encryption.
+ *     Saves ~1 full masked-decrypt round-trip (~K×RTT) per normal iteration.
+ *   - side-decrypt interval: objective monitoring every SIDE_DECRYPT_INTERVAL
+ *     iters instead of every iter (was already done in this version).
+ *
+ * Protocol signals added:
+ *   MAGIC_DO_U_DECRYPT   (0x00000006) — server tells clients: decrypt u this iter
+ *   MAGIC_SKIP_U_DECRYPT (0x00000007) — server tells clients: skip u decrypt
  */
 
 #include "openfhe/pke/openfhe.h"
@@ -71,16 +78,21 @@ static const int    BASE_PORT      = 10000;
 static const size_t N_FEAT         = 200;
 static const size_t M_ROWS         = 50;
 static const double rho            = 1.0;
-static const double lambda_lasso   = 0.1;   // FIX: was 1.0 → caused obj~1e14
+static const double lambda_lasso   = 0.1;
 static const int    maxIter        = 50;
 static const int    updateInterval = 5;
 static const int    shrinkWarmup   = 5;
-static const int    chebyDegree    = 15;
+static const int    chebyDegree    = 13;
 static const double alpha_crc      = 1.2;
 static const double gamma_smooth   = 0.8;
 static const double delta_safe     = 0.95;
-static const int    Lmin_levels    = 6;     // FIX: was 3 → refresh earlier
+static const int    Lmin_levels    = 6;
 static const double kappa          = lambda_lasso / (rho * NUM_PARTIES);
+
+// How many levels does one Chebyshev call consume?
+// deg=13 → ceil(log2(13+1))=4 squarings + a few mults ≈ 8 levels consumed.
+// We pre-trigger u-decrypt one iteration before remLev would drop below Lmin.
+static const int    REFRESH_LOOKAHEAD = 1;   // trigger u-decrypt this many iters before refresh
 
 // Pi deployment IPs — set all to "127.0.0.1" for local mode
 static const char* CLIENT_IPS[3] = {
@@ -89,17 +101,23 @@ static const char* CLIENT_IPS[3] = {
     "192.168.186.214"
 };
 
-static const uint32_t MAGIC_READY       = 0xCAFEBABE;
-static const uint32_t MAGIC_REFRESH     = 0xABCD1234;
-static const uint32_t MAGIC_ITERDONE   = 0x00000001;
-static const uint32_t MAGIC_END         = 0xFFFFFFFF;
-static const uint32_t MAGIC_PLAIN_ADMM  = 0xAAAAAAAA;
-static const uint32_t MAGIC_TRIAD_START = 0xBBBBBBBB;
-static const uint32_t MAGIC_STATIC_R    = 0xCCCCCCCC;
-static const uint32_t MAGIC_ADAPTIVE    = 0xDDDDDDDD;
-static const uint32_t MAGIC_ALL_DONE    = 0xEEEEEEEE;
-static const uint32_t MAGIC_ABORT_SR    = 0xCC1EAF01;  // early-abort for Static-R experiment
-static const uint32_t MAGIC_CONTINUE_ITER = 0x00000003; // proceed with next iteration
+static const uint32_t MAGIC_READY         = 0xCAFEBABE;
+static const uint32_t MAGIC_REFRESH       = 0xABCD1234;
+static const uint32_t MAGIC_ITERDONE      = 0x00000001;
+static const uint32_t MAGIC_END           = 0xFFFFFFFF;
+static const uint32_t MAGIC_PLAIN_ADMM    = 0xAAAAAAAA;
+static const uint32_t MAGIC_TRIAD_START   = 0xBBBBBBBB;
+static const uint32_t MAGIC_STATIC_R      = 0xCCCCCCCC;
+static const uint32_t MAGIC_ADAPTIVE      = 0xDDDDDDDD;
+static const uint32_t MAGIC_ALL_DONE      = 0xEEEEEEEE;
+static const uint32_t MAGIC_ABORT_SR      = 0xCC1EAF01;
+static const uint32_t MAGIC_CONTINUE_ITER = 0x00000003;
+static const uint32_t MAGIC_DO_MONITOR    = 0x00000004;
+static const uint32_t MAGIC_SKIP_MONITOR  = 0x00000005;
+static const uint32_t MAGIC_DO_U_DECRYPT  = 0x00000006;  // NEW: lazy u-decrypt signal
+static const uint32_t MAGIC_SKIP_U_DECRYPT= 0x00000007;  // NEW: skip u-decrypt signal
+
+static const int SIDE_DECRYPT_INTERVAL    = 5;
 
 // ============================================================================
 // Network helpers
@@ -249,7 +267,7 @@ static double computeObjective(const vector<double>& z,
 }
 
 // ============================================================================
-// Matrix algebra helpers (same logic as client.cpp)
+// Matrix algebra helpers
 // ============================================================================
 static Mat transpose(const Mat& A) {
     size_t m = A.size(), n = A[0].size();
@@ -345,7 +363,7 @@ int main(int argc, char* argv[]) {
     cout << "  lambda=" << lambda_lasso << " kappa=" << kappa
          << " Lmin=" << Lmin_levels << endl;
 
-    vector<double> zPlain(N_FEAT, 0.0);  // filled by distributed plaintext ADMM below
+    vector<double> zPlain(N_FEAT, 0.0);
 
     // -----------------------------------------------------------------------
     // Phase 0: Load keys
@@ -415,7 +433,7 @@ int main(int argc, char* argv[]) {
     cout << "  All clients ready (t=" << elapsed() << "s)" << endl;
 
     // -----------------------------------------------------------------------
-    // Distributed Plaintext ADMM baseline (Pi clients participate via network)
+    // Distributed Plaintext ADMM baseline
     // -----------------------------------------------------------------------
     if (!triadOnly) {
     cout << "\n[Plaintext ADMM] Starting distributed baseline..." << endl;
@@ -429,25 +447,20 @@ int main(int argc, char* argv[]) {
         plog << "iter,objective,elapsed_s\n";
 
         for (int iter = 0; iter < maxIter; iter++) {
-            // Send v_i = z - u_i to each client
             for (int i = 0; i < NUM_PARTIES; i++)
                 sendVec(fds[i], vecsub(zP, uP[i]));
 
-            // Receive x_i from each client
             vector<vector<double>> xP(NUM_PARTIES);
             for (int i = 0; i < NUM_PARTIES; i++)
                 xP[i] = recvVec(fds[i]);
 
-            // z-update: w = (1/K)*sum(x_i+u_i), z = softThresh(w, kappa)
             vector<double> w(N_FEAT, 0.0);
             for (int i = 0; i < NUM_PARTIES; i++)
                 w = vecadd(w, vecadd(xP[i], uP[i]));
-            // Diagnostic: track max|w/K| so we know the real range R should cover
             double maxW = 0.0;
             for (double v : w) maxW = max(maxW, fabs(v / NUM_PARTIES));
             zP = softThreshVec(vecscale(w, 1.0 / NUM_PARTIES), kappa);
 
-            // u_i update
             for (int i = 0; i < NUM_PARTIES; i++)
                 uP[i] = vecadd(uP[i], vecsub(xP[i], zP));
 
@@ -464,11 +477,10 @@ int main(int argc, char* argv[]) {
         cout << "[Plaintext ADMM] Done. Final obj="
              << computeObjective(zPlain, globalA, globalB) << endl;
     }
-    } // end if (!triadOnly) — PlainADMM
+    } // end PlainADMM
 
     // -----------------------------------------------------------------------
-    // Static-R experiments (before TRIAD, for comparison)
-    // Protocol: bcast MAGIC_STATIC_R + R → run 50 iters (no CRC) → MAGIC_END
+    // Static-R experiments (disabled — loop body is skipped via continue)
     // -----------------------------------------------------------------------
     struct SRResult { string label; double finalObj; bool exploded; };
     vector<SRResult> srResults;
@@ -478,200 +490,12 @@ int main(int argc, char* argv[]) {
 
     const vector<double> staticRs = {0.5, 1.5, 2.0, 3.0, 5.0, 10.0};
     for (double sr : staticRs) {
-        ostringstream oss; oss << fixed << setprecision(1) << sr;
-        string label = "StaticR_" + oss.str();
-        cout << "\n===== " << label << " =====" << endl;
-
-        bcastU32(fds, MAGIC_STATIC_R);
-        bcastD(fds, sr);
-
-        auto ptZ0 = cc->MakeCKKSPackedPlaintext(vector<double>(N_FEAT, 0.0));
-        auto encZS = cc->Encrypt(jointPK, ptZ0);
-        vector<Ciphertext<DCRTPoly>> encUS(NUM_PARTIES);
-        for (int i = 0; i < NUM_PARTIES; i++)
-            encUS[i] = cc->Encrypt(jointPK, ptZ0);
-        double RS     = sr;
-        auto   coeffS = chebyCoeffs(RS, chebyDegree);
-
-        string fname = label;
-        for (char& c : fname) if (!isalnum(c) && c != '_') c = '_';
-        ofstream slog(fname + "_log.csv");
-        slog << "iter,R,remLev,refresh,objective,mem_used_MB,elapsed_s\n";
-        bool exploded   = false;
-        bool abort_next = false;   // set when explosion/decrypt-fail detected
-        double prev_obj = -1.0;   // for relative-jump detection
-
-        for (int iter = 0; iter < maxIter; iter++) {
-            bool did_ref = false;
-            size_t remLev = totalLevels - encZS->GetLevel() - 1;
-
-            // ── Pre-iteration handshake: abort immediately or signal clients to continue ──
-            if (abort_next) {
-                cout << "  [ABORT] " << label << " aborted at iter=" << iter
-                     << " — skipping remaining iterations" << endl;
-                bcastU32(fds, MAGIC_ABORT_SR);
-                slog << iter << "," << RS << "," << remLev
-                     << "," << 0 << ",ABORT," << elapsed() << "\n";
-                slog.flush();
-                break;
-            }
-            bcastU32(fds, MAGIC_CONTINUE_ITER);
-
-            cout << "  iter=" << setw(2) << iter
-                 << "  R=" << RS << "  remLev=" << remLev
-                 << "  t=" << fixed << setprecision(1) << elapsed() << "s" << endl;
-            cout.flush();
-
-            // a) recv masks
-            vector<Ciphertext<DCRTPoly>> encRvS(NUM_PARTIES), encRuS(NUM_PARTIES);
-            for (int i = 0; i < NUM_PARTIES; i++) {
-                encRvS[i] = recvObj<Ciphertext<DCRTPoly>>(fds[i], cc);
-                encRuS[i] = recvObj<Ciphertext<DCRTPoly>>(fds[i], cc);
-            }
-            cout << "    [a] masks received" << endl; cout.flush();
-
-            // b) Phase A: all v masked-decrypts
-            for (int i = 0; i < NUM_PARTIES; i++)
-                maskedDecryptSend(i, fds, cc->EvalSub(encZS, encUS[i]), encRvS[i], cc, N_FEAT);
-            cout << "    [b] v masked-decrypts done" << endl; cout.flush();
-
-            // c) collect enc(x_i)
-            vector<Ciphertext<DCRTPoly>> encXS(NUM_PARTIES);
-            for (int i = 0; i < NUM_PARTIES; i++)
-                encXS[i] = recvObj<Ciphertext<DCRTPoly>>(fds[i], cc);
-            cout << "    [c] enc(x_i) collected" << endl; cout.flush();
-
-            // d) Phase C: all u masked-decrypts
-            for (int i = 0; i < NUM_PARTIES; i++)
-                maskedDecryptSend(i, fds, encUS[i], encRuS[i], cc, N_FEAT);
-            cout << "    [d] u masked-decrypts done" << endl; cout.flush();
-
-            // e) enc(w) — NO CRC for Static-R
-            auto encWS = cc->EvalAdd(encXS[0], encUS[0]);
-            for (int i = 1; i < NUM_PARTIES; i++)
-                encWS = cc->EvalAdd(encWS, cc->EvalAdd(encXS[i], encUS[i]));
-            encWS = cc->EvalMult(encWS, 1.0 / NUM_PARTIES);
-
-            // f) Chebyshev z-update with fixed R
-            cout << "    [f] EvalChebyshevSeries..." << endl; cout.flush();
-            auto encZnewS = cc->EvalChebyshevSeries(
-                                cc->EvalMult(encWS, 1.0 / RS), coeffS, -1.0, 1.0);
-
-            // g) broadcast enc(z), collect enc(u_i)
-            bcast(fds, encZnewS, cc);
-            for (int i = 0; i < NUM_PARTIES; i++)
-                encUS[i] = recvObj<Ciphertext<DCRTPoly>>(fds[i], cc);
-            encZS = encZnewS;
-            cout << "    [g] enc(z) broadcast, enc(u_i) collected" << endl; cout.flush();
-
-            // h) Refresh or ITERDONE
-            remLev = totalLevels - encZS->GetLevel() - 1;
-            if ((int)remLev < Lmin_levels) {
-                did_ref = true;
-                cout << "    [h] Refresh (remLev=" << remLev << ")..." << endl; cout.flush();
-                bcastU32(fds, MAGIC_REFRESH);
-                bcast(fds, encZS, cc);
-                vector<Ciphertext<DCRTPoly>> zshS(NUM_PARTIES);
-                for (int i = 0; i < NUM_PARTIES; i++)
-                    zshS[i] = recvObj<Ciphertext<DCRTPoly>>(fds[i], cc);
-                Plaintext ptZpS; cc->MultipartyDecryptFusion(zshS, &ptZpS); ptZpS->SetLength(N_FEAT);
-                encZS = cc->Encrypt(jointPK, cc->MakeCKKSPackedPlaintext(ptZpS->GetRealPackedValue()));
-                bcast(fds, encZS, cc);
-                for (int i = 0; i < NUM_PARTIES; i++)
-                    encUS[i] = recvObj<Ciphertext<DCRTPoly>>(fds[i], cc);
-                cout << "    [h] Refresh done, remLev=" << (totalLevels-encZS->GetLevel()-1) << endl;
-            } else {
-                bcastU32(fds, MAGIC_ITERDONE);
-            }
-
-            // i) side-decrypt for objective monitoring
-            double obj = -1.0;
-            bool step_failed = false;
-            {
-                bcast(fds, encZS, cc);
-                vector<Ciphertext<DCRTPoly>> objShS(NUM_PARTIES);
-                for (int i = 0; i < NUM_PARTIES; i++)
-                    objShS[i] = recvObj<Ciphertext<DCRTPoly>>(fds[i], cc);
-                try {
-                    Plaintext ptObjS; cc->MultipartyDecryptFusion(objShS, &ptObjS);
-                    ptObjS->SetLength(N_FEAT);
-                    auto zvecS = ptObjS->GetRealPackedValue(); zvecS.resize(N_FEAT);
-                    obj = computeObjective(zvecS, globalA, globalB);
-                    bool burst   = (prev_obj > 0.0 && obj > prev_obj * 100.0 && obj > 100.0);
-                    bool abs_exp = (obj > 1e4);
-                    bool nan_inf = (std::isnan(obj) || std::isinf(obj));
-                    if (!exploded && (burst || abs_exp || nan_inf)) {
-                        string reason = nan_inf ? "NaN/Inf" : (burst ? "100x_jump" : "obj>1e4");
-                        cout << "    [EXPLOSION] obj=" << obj
-                             << " prev=" << prev_obj
-                             << " reason=" << reason
-                             << " (R=" << sr << " too small)" << endl;
-                        exploded   = true;
-                        abort_next = true;   // abort at step-h of NEXT iteration
-                    } else {
-                        cout << "    obj=" << fixed << setprecision(6) << obj << endl;
-                        prev_obj = obj;
-                    }
-                } catch (...) {
-                    cout << "    [DECRYPT_FAIL] iter=" << iter
-                         << " — scheduling abort for " << label << endl;
-                    step_failed = true;
-                    abort_next  = true;
-                    exploded    = true;
-                }
-            }
-            // collect mem_used_MB from each Pi
-            double avg_memS = 0.0;
-            for (int i = 0; i < NUM_PARTIES; i++) avg_memS += recvD(fds[i]);
-            avg_memS /= NUM_PARTIES;
-            cout << "    [iter " << iter << " done] t=" << fixed << setprecision(1)
-                 << elapsed() << "s" << endl; cout.flush();
-            slog << iter << "," << RS << "," << (totalLevels-encZS->GetLevel()-1)
-                 << "," << did_ref << ","
-                 << (step_failed ? "FAIL" : (obj < 0 ? "NaN" : to_string(obj)))
-                 << "," << fixed << setprecision(2) << avg_memS
-                 << "," << elapsed() << "\n";
-            slog.flush();
-        }
-        slog.close();
-        // Final decrypt for this static-R run
-        cout << "  [FinalDecrypt] sending MAGIC_END, collecting shares..." << endl;
-        cout.flush();
-        bcastU32(fds, MAGIC_END);
-        bcast(fds, encZS, cc);
-        cout << "  [FinalDecrypt] enc(z) sent, waiting for partial decrypts..." << endl;
-        cout.flush();
-        vector<Ciphertext<DCRTPoly>> fshS(NUM_PARTIES);
-        for (int i = 0; i < NUM_PARTIES; i++) {
-            fshS[i] = recvObj<Ciphertext<DCRTPoly>>(fds[i], cc);
-            cout << "  [FinalDecrypt] got partial from client " << i
-                 << "  t=" << fixed << setprecision(1) << elapsed() << "s" << endl;
-            cout.flush();
-        }
-        cout << "  [FinalDecrypt] fusing..." << endl; cout.flush();
-        double finalObjS = std::numeric_limits<double>::quiet_NaN();
-        try {
-            Plaintext ptFS; cc->MultipartyDecryptFusion(fshS, &ptFS);
-            ptFS->SetLength(N_FEAT);
-            auto zFS = ptFS->GetRealPackedValue();
-            for (int i = 0; i < NUM_PARTIES; i++) sendVec(fds[i], zFS);
-            finalObjS = computeObjective(zFS, globalA, globalB);
-            cout << "  Final obj=" << finalObjS;
-        } catch (...) {
-            cout << "  [FINAL_DECRYPT_FAIL] decryption failed for " << label
-                 << " — sending zero vec to keep sync" << endl;
-            vector<double> zeroVec(N_FEAT, 0.0);
-            for (int i = 0; i < NUM_PARTIES; i++) sendVec(fds[i], zeroVec);
-            exploded = true;
-        }
-        if (exploded) cout << "  [EXPLODED]";
-        cout << "\n  t=" << elapsed() << "s" << endl;
-        srResults.push_back({label, finalObjS, exploded});
+        (void)sr; continue; // Static-R disabled
     }
-    } // end if (!triadOnly) — Static-R
+    } // end Static-R
 
     // -----------------------------------------------------------------------
-    // Signal TRIAD start — client proceeds to Phase 1
+    // Signal TRIAD start
     // -----------------------------------------------------------------------
     bcastU32(fds, MAGIC_TRIAD_START);
     cout << "  MAGIC_TRIAD_START sent (t=" << elapsed() << "s)" << endl;
@@ -718,15 +542,16 @@ int main(int argc, char* argv[]) {
          << "(Lmin=" << Lmin_levels << " totalLev=" << totalLevels << ")..." << endl;
 
     ofstream log("Adaptive_TRIAD_log.csv");
-    log << "iter,R,remLev,crc,refresh,objective,mse,cpu_temp_C,mem_used_MB,net_bytes,cpu_freq_MHz,elapsed_s\n";
+    log << "iter,R,remLev,crc,refresh,u_decrypt,objective,mse,"
+           "cpu_temp_C,mem_used_MB,net_MBps_client,cpu_freq_MHz,elapsed_s\n";
     ofstream tlog("timing_log.csv");
     tlog << "iter,t_mask_ms,t_vdecrypt_ms,t_xcollect_ms,t_udecrypt_ms,t_wupdate_ms"
-            ",t_crc_ms,t_cheby_ms,t_broadcast_ms,t_refresh_ms,t_sidedecrypt_ms,t_total_ms\n";
+            ",t_crc_ms,t_cheby_ms,t_broadcast_ms,t_refresh_ms,t_sidedecrypt_ms,t_total_ms"
+            ",t_compute_ms,t_comm_normal_ms,t_comm_crc_ms,t_wait_ms,crc_overhead_pct\n";
 
-    // R-adaptation history (Bootstrap-R + each CRC update)
     struct REvent { int iter; double oldR; double R_raw; double newR; double Psi; bool safeAll; };
     vector<REvent> rHistory;
-    rHistory.push_back({-1, 0.0, 0.0, currentR, 0.0, true});  // Bootstrap-R initial value
+    rHistory.push_back({-1, 0.0, 0.0, currentR, 0.0, true});
 
     using hrc = chrono::high_resolution_clock;
     auto hms = [](hrc::time_point a, hrc::time_point b) {
@@ -736,9 +561,21 @@ int main(int argc, char* argv[]) {
                    v_t_wupdate, v_t_crc, v_t_cheby, v_t_broadcast,
                    v_t_refresh, v_t_sidedecrypt, v_t_total;
 
+    // Client needs ui plaintext only when a Refresh is about to happen.
+    // We predict refresh by checking if remLev after this iter's Chebyshev
+    // will fall below Lmin_levels. Since we know chebyDegree, we can estimate
+    // how many levels the next EvalChebyshevSeries will consume and pre-send
+    // u REFRESH_LOOKAHEAD iterations ahead.
+    //
+    // Simpler and robust approach: send u decrypt whenever
+    //   remLev - cheby_cost <= Lmin_levels + REFRESH_LOOKAHEAD
+    // where cheby_cost is estimated conservatively as ceil(log2(chebyDegree+1))*2.
+    const int cheby_level_cost = 2 * (int)ceil(log2((double)(chebyDegree + 1)));
+    cout << "  Estimated Chebyshev level cost per iter: " << cheby_level_cost << endl;
+
     for (int iter = 0; iter < maxIter; iter++) {
         auto tp_start = hrc::now();
-        bool did_crc = false, did_ref = false;
+        bool did_crc = false, did_ref = false, did_u_decrypt = false;
         size_t remLevels = totalLevels - encZ->GetLevel() - 1;
         cout << "  iter=" << setw(2) << iter
              << "  R=" << fixed << setprecision(4) << currentR
@@ -746,7 +583,24 @@ int main(int argc, char* argv[]) {
              << "  t=" << fixed << setprecision(1) << elapsed() << "s" << endl;
         cout.flush();
 
-        // a) recv masks
+        // ── Decide whether to do u-decrypt this iteration ──────────────────
+        // We need ui plaintext BEFORE the Refresh call in step (i).
+        // A Refresh fires when remLev (after Chebyshev) < Lmin_levels.
+        // remLev after Chebyshev ≈ remLevels - cheby_level_cost.
+        // So fire u-decrypt whenever that predicted value is within
+        // REFRESH_LOOKAHEAD of Lmin_levels, i.e.:
+        //   remLevels - cheby_level_cost <= Lmin_levels + REFRESH_LOOKAHEAD
+        bool need_u_decrypt = ((int)remLevels - cheby_level_cost
+                                <= Lmin_levels + REFRESH_LOOKAHEAD);
+
+        // Also always do u-decrypt on iter 0 so clients have initial ui=0
+        // confirmed (not strictly necessary since ui starts at 0, but safe).
+        // Uncomment if you want extra safety:
+        // need_u_decrypt |= (iter == 0);
+
+        // a) recv masks from all clients
+        // Clients always send both enc(r_v) and enc(r_u).
+        // Server only uses enc(r_u) when need_u_decrypt is true.
         vector<Ciphertext<DCRTPoly>> encRv(NUM_PARTIES), encRu(NUM_PARTIES);
         for (int i = 0; i < NUM_PARTIES; i++) {
             encRv[i] = recvObj<Ciphertext<DCRTPoly>>(fds[i], cc);
@@ -754,7 +608,7 @@ int main(int argc, char* argv[]) {
         }
         auto tp_a = hrc::now();
 
-        // b) masked decrypt ALL v_i
+        // b) masked decrypt ALL v_i  (always required for x-update)
         for (int i = 0; i < NUM_PARTIES; i++)
             maskedDecryptSend(i, fds, cc->EvalSub(encZ, encU[i]), encRv[i], cc, N_FEAT);
         auto tp_b = hrc::now();
@@ -765,9 +619,18 @@ int main(int argc, char* argv[]) {
             encX[i] = recvObj<Ciphertext<DCRTPoly>>(fds[i], cc);
         auto tp_c = hrc::now();
 
-        // d) masked decrypt ALL u_i
-        for (int i = 0; i < NUM_PARTIES; i++)
-            maskedDecryptSend(i, fds, encU[i], encRu[i], cc, N_FEAT);
+        // d) LAZY u-decrypt: only when a Refresh is imminent
+        //    Signal clients first so they know whether to expect the decrypt.
+        if (need_u_decrypt) {
+            did_u_decrypt = true;
+            bcastU32(fds, MAGIC_DO_U_DECRYPT);
+            for (int i = 0; i < NUM_PARTIES; i++)
+                maskedDecryptSend(i, fds, encU[i], encRu[i], cc, N_FEAT);
+            cout << "    [d] u masked-decrypts done (pre-refresh)" << endl;
+        } else {
+            bcastU32(fds, MAGIC_SKIP_U_DECRYPT);
+            // enc(r_u) that clients sent are discarded — no RTT spent.
+        }
         auto tp_d = hrc::now();
 
         // e) enc(w) = (1/K)*sum(enc(x_i)+enc(u_i))
@@ -795,7 +658,7 @@ int main(int argc, char* argv[]) {
             if (R_raw > currentR) {
                 currentR = R_raw;
             } else if (!safeAll) {
-                currentR = currentR / delta_safe;  // 主动扩张：w已接近边界，反推安全R
+                currentR = currentR / delta_safe;
             } else if (iter > shrinkWarmup && safeAll) {
                 currentR = max(R_raw, gamma_smooth * currentR);
             }
@@ -840,9 +703,11 @@ int main(int argc, char* argv[]) {
         }
         auto tp_i = hrc::now();
 
-        // j) side-decrypt for objective monitoring
+        // j) side-decrypt for objective monitoring (sparse)
         double obj = -1.0, mse = -1.0;
-        {
+        bool do_monitor = (iter % SIDE_DECRYPT_INTERVAL == 0) || (iter == maxIter - 1);
+        if (do_monitor) {
+            bcastU32(fds, MAGIC_DO_MONITOR);
             bcast(fds, encZ, cc);
             vector<Ciphertext<DCRTPoly>> objSh(NUM_PARTIES);
             for (int i = 0; i < NUM_PARTIES; i++)
@@ -862,30 +727,33 @@ int main(int argc, char* argv[]) {
                 cout << "    obj=" << fixed << setprecision(6) << obj
                      << "  mse=" << mse << endl;
             } catch (...) { cout << "    obj=N/A" << endl; }
+        } else {
+            bcastU32(fds, MAGIC_SKIP_MONITOR);
         }
+
         // j2) Collect per-iteration system metrics from Pi clients
-        double avg_temp = 0.0, avg_mem = 0.0, avg_net = 0.0, avg_freq = 0.0;
+        double avg_temp = 0.0, avg_mem = 0.0, avg_net_MBps = 0.0, avg_freq = 0.0;
         for (int i = 0; i < NUM_PARTIES; i++) {
             avg_temp += recvD(fds[i]);
             avg_mem  += recvD(fds[i]);
-            avg_net  += recvD(fds[i]);
+            avg_net_MBps += recvD(fds[i]);
             avg_freq += recvD(fds[i]);
         }
         avg_temp /= NUM_PARTIES; avg_mem /= NUM_PARTIES;
-        avg_net  /= NUM_PARTIES; avg_freq /= NUM_PARTIES;
+        avg_net_MBps /= NUM_PARTIES; avg_freq /= NUM_PARTIES;
         auto tp_j = hrc::now();
 
-        double dt_mask       = hms(tp_start, tp_a);
-        double dt_vdecrypt   = hms(tp_a,     tp_b);
-        double dt_xcollect   = hms(tp_b,     tp_c);
-        double dt_udecrypt   = hms(tp_c,     tp_d);
-        double dt_wupdate    = hms(tp_d,     tp_e);
-        double dt_crc        = hms(tp_e,     tp_f);
-        double dt_cheby      = hms(tp_f,     tp_g);
-        double dt_broadcast  = hms(tp_g,     tp_h);
-        double dt_refresh    = hms(tp_h,     tp_i);
-        double dt_sidedecrypt= hms(tp_i,     tp_j);
-        double dt_total      = hms(tp_start, tp_j);
+        double dt_mask        = hms(tp_start, tp_a);
+        double dt_vdecrypt    = hms(tp_a,     tp_b);
+        double dt_xcollect    = hms(tp_b,     tp_c);
+        double dt_udecrypt    = hms(tp_c,     tp_d);
+        double dt_wupdate     = hms(tp_d,     tp_e);
+        double dt_crc         = hms(tp_e,     tp_f);
+        double dt_cheby       = hms(tp_f,     tp_g);
+        double dt_broadcast   = hms(tp_g,     tp_h);
+        double dt_refresh     = hms(tp_h,     tp_i);
+        double dt_sidedecrypt = hms(tp_i,     tp_j);
+        double dt_total       = hms(tp_start, tp_j);
 
         v_t_mask.push_back(dt_mask);
         v_t_vdecrypt.push_back(dt_vdecrypt);
@@ -901,20 +769,55 @@ int main(int argc, char* argv[]) {
 
         log << iter << "," << currentR << ","
             << (totalLevels-encZ->GetLevel()-1) << ","
-            << did_crc << "," << did_ref << ","
+            << did_crc << "," << did_ref << "," << did_u_decrypt << ","
             << (obj<0?"NaN":to_string(obj)) << ","
             << (mse<0?"NaN":to_string(mse)) << ","
             << fixed << setprecision(2)
             << avg_temp << "," << avg_mem << ","
-            << avg_net  << "," << avg_freq << ","
+            << avg_net_MBps << "," << avg_freq << ","
             << elapsed() << "\n";
         log.flush();
+        double comm_normal_ms = dt_mask + dt_xcollect + dt_broadcast;
+        double comm_crc_ms    = did_crc ? dt_crc : 0.0;
+        double comp_ms        = dt_wupdate + dt_cheby;
+        double wait_ms        = dt_vdecrypt + dt_udecrypt + dt_refresh + dt_sidedecrypt;
+        double crc_pct        = dt_total > 0.0 ? 100.0 * comm_crc_ms / dt_total : 0.0;
+
         tlog << iter << fixed << setprecision(3)
              << "," << dt_mask << "," << dt_vdecrypt << "," << dt_xcollect
              << "," << dt_udecrypt << "," << dt_wupdate << "," << dt_crc
              << "," << dt_cheby << "," << dt_broadcast << "," << dt_refresh
-             << "," << dt_sidedecrypt << "," << dt_total << "\n";
+             << "," << dt_sidedecrypt << "," << dt_total
+             << "," << comp_ms << "," << comm_normal_ms << "," << comm_crc_ms
+             << "," << wait_ms << "," << setprecision(2) << crc_pct << "\n";
         tlog.flush();
+
+        // ── Latency breakdown snapshot at iter 20, 30, 40 ──────────────────
+        if (iter == 20 || iter == 30 || iter == 40) {
+            cout << "\n  ┌─── Latency Snapshot @ iter=" << iter
+                 << " (total=" << fixed << setprecision(1) << dt_total << " ms) ───┐" << endl;
+            cout << "  │  Compute   (encW+Cheby)         : " << setw(8) << fixed << setprecision(1)
+                 << comp_ms << " ms  (" << setw(5) << fixed << setprecision(1)
+                 << 100.0*comp_ms/dt_total << "%)" << endl;
+            cout << "  │  Comm-norm (masks+xcollect+bcast): " << setw(8) << fixed << setprecision(1)
+                 << comm_normal_ms << " ms  (" << setw(5) << fixed << setprecision(1)
+                 << 100.0*comm_normal_ms/dt_total << "%)" << endl;
+            cout << "  │  Comm-CRC  (extra CRC round-trip): " << setw(8) << fixed << setprecision(1)
+                 << comm_crc_ms << " ms  (" << setw(5) << fixed << setprecision(2)
+                 << crc_pct << "%)  <-- CRC overhead" << endl;
+            cout << "  │  Wait      (decrypt+refresh+side): " << setw(8) << fixed << setprecision(1)
+                 << wait_ms << " ms  (" << setw(5) << fixed << setprecision(1)
+                 << 100.0*wait_ms/dt_total << "%)" << endl;
+            cout << "  │    ├ v-masked-decrypt            : " << setw(8) << fixed << setprecision(1)
+                 << dt_vdecrypt << " ms" << endl;
+            cout << "  │    ├ u-masked-decrypt            : " << setw(8) << fixed << setprecision(1)
+                 << dt_udecrypt << " ms" << endl;
+            cout << "  │    ├ Refresh                     : " << setw(8) << fixed << setprecision(1)
+                 << dt_refresh << " ms" << endl;
+            cout << "  │    └ Side-decrypt                : " << setw(8) << fixed << setprecision(1)
+                 << dt_sidedecrypt << " ms" << endl;
+            cout << "  └─────────────────────────────────────────────────────────────┘" << endl;
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -936,14 +839,11 @@ int main(int argc, char* argv[]) {
     cout << "\nFinal objective: " << computeObjective(zF, globalA, globalB) << endl;
     cout << "Total time: " << elapsed() << "s" << endl;
 
-    // -----------------------------------------------------------------------
-    // Results summary — three separate tables
-    // -----------------------------------------------------------------------
     srResults.push_back({"Adaptive_TRIAD", computeObjective(zF, globalA, globalB), false});
 
-    // ── Table 1: Objective function (all algorithms) ─────────────────────────
+    // ── Table 1: Objective function ──────────────────────────────────────────
     cout << "\n============================================================" << endl;
-    cout << " Table 1: Objective Function Comparison (all algorithms)" << endl;
+    cout << " Table 1: Objective Function Comparison" << endl;
     cout << "============================================================" << endl;
     cout << left << setw(26) << "Algorithm"
          << right << setw(16) << "Final Objective"
@@ -956,21 +856,20 @@ int main(int argc, char* argv[]) {
         cout << "\n";
     }
     cout << "============================================================" << endl;
-    cout << "  Logs: plaintext_admm_log.csv  StaticR_*_log.csv  Adaptive_TRIAD_log.csv" << endl;
 
-    // ── Table 2: Latency breakdown (TRIAD / Adaptive only) ───────────────────
+    // ── Table 2: Latency breakdown ───────────────────────────────────────────
     {
         int N = (int)v_t_total.size();
         if (N > 0) {
             auto mean_v = [&](const vector<double>& v) {
                 double s = 0; for (double x : v) s += x; return s / v.size();
             };
-            double mu_mask   = mean_v(v_t_mask),   mu_vdec = mean_v(v_t_vdecrypt),
-                   mu_xcol   = mean_v(v_t_xcollect),mu_udec = mean_v(v_t_udecrypt),
-                   mu_wup    = mean_v(v_t_wupdate), mu_crc  = mean_v(v_t_crc),
-                   mu_cheby  = mean_v(v_t_cheby),   mu_bcast= mean_v(v_t_broadcast),
-                   mu_ref    = mean_v(v_t_refresh),  mu_side= mean_v(v_t_sidedecrypt),
-                   mu_total  = mean_v(v_t_total);
+            double mu_mask  = mean_v(v_t_mask),    mu_vdec = mean_v(v_t_vdecrypt),
+                   mu_xcol  = mean_v(v_t_xcollect), mu_udec = mean_v(v_t_udecrypt),
+                   mu_wup   = mean_v(v_t_wupdate),  mu_crc  = mean_v(v_t_crc),
+                   mu_cheby = mean_v(v_t_cheby),    mu_bcast= mean_v(v_t_broadcast),
+                   mu_ref   = mean_v(v_t_refresh),  mu_side = mean_v(v_t_sidedecrypt),
+                   mu_total = mean_v(v_t_total);
 
             cout << "\n============================================================" << endl;
             cout << " Table 2: Per-Iteration Latency Breakdown (Adaptive TRIAD)" << endl;
@@ -983,21 +882,20 @@ int main(int argc, char* argv[]) {
                 cout << left << setw(22) << name
                      << right << setw(12) << fixed << setprecision(2) << mu << "\n";
             };
-            row("(a) recv_masks",      mu_mask);
-            row("(b) v_masked_decrypt",mu_vdec);
-            row("(c) x_collect",       mu_xcol);
-            row("(d) u_masked_decrypt",mu_udec);
-            row("(e) w_update",        mu_wup);
-            row("(f) CRC",             mu_crc);
-            row("(g) Chebyshev",       mu_cheby);
-            row("(h) broadcast_z+u",   mu_bcast);
-            row("(i) refresh",         mu_ref);
-            row("(j) side_decrypt",    mu_side);
+            row("(a) recv_masks",       mu_mask);
+            row("(b) v_masked_decrypt", mu_vdec);
+            row("(c) x_collect",        mu_xcol);
+            row("(d) u_decrypt(lazy)",  mu_udec);
+            row("(e) w_update",         mu_wup);
+            row("(f) CRC",              mu_crc);
+            row("(g) Chebyshev",        mu_cheby);
+            row("(h) broadcast_z+u",    mu_bcast);
+            row("(i) refresh",          mu_ref);
+            row("(j) side_decrypt",     mu_side);
             cout << string(36, '-') << endl;
-            row("TOTAL",               mu_total);
+            row("TOTAL",                mu_total);
             cout << "============================================================" << endl;
 
-            // ── Table 3: Throughput ───────────────────────────────────────────
             double mean_total_s = mu_total / 1000.0;
             double throughput   = (mean_total_s > 0) ? (double)N_FEAT / mean_total_s : 0.0;
             cout << "\n============================================================" << endl;
@@ -1013,7 +911,7 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // ── Table 4: R adaptation history (Adaptive TRIAD) ───────────────────────
+    // ── Table 4: R adaptation history ────────────────────────────────────────
     {
         cout << "\n============================================================" << endl;
         cout << " Table 4: R Adaptation History (Adaptive TRIAD)" << endl;

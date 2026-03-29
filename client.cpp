@@ -10,12 +10,15 @@
  * Prerequisites:
  *   keys/cryptocontext.bin  keys/joint_pk.bin  keys/sk_<id>.bin
  *
- * FIXES vs previous version:
- *   - lambda_lasso = 0.1  (must match server.cpp)
- *   - Protocol order: Phase A (all v) → send x → Phase C (all u)
- *     Client now loops j=0..K-1 for ALL v decrypts before sending x,
- *     then loops j=0..K-1 for ALL u decrypts. Matches server.cpp exactly.
- *   - Objective side-decrypt added at end of each iter (matches server.cpp step j)
+ * OPTIMIZATIONS vs previous version:
+ *   - Lazy u-decrypt: client checks MAGIC_DO_U_DECRYPT / MAGIC_SKIP_U_DECRYPT
+ *     signal from server before step (d). In most iterations the signal is
+ *     SKIP, so no masked-decrypt round-trip occurs and ui plaintext is not
+ *     updated. The ui plaintext is only refreshed when the server signals DO,
+ *     which happens the iteration immediately before a Refresh is needed.
+ *   - enc(r_u) is always sent in step (a) so the server can use it when
+ *     needed without an extra round-trip to request it.
+ *   - side-decrypt is gated by MAGIC_DO_MONITOR / MAGIC_SKIP_MONITOR.
  */
 
 #include "openfhe/pke/openfhe.h"
@@ -63,26 +66,30 @@ static const int    BASE_PORT      = 10000;
 static const size_t N_FEAT         = 200;
 static const size_t M_ROWS         = 50;
 static const double rho            = 1.0;
-static const double lambda_lasso   = 0.1;   // FIX: must match server.cpp
+static const double lambda_lasso   = 0.1;
 static const int    maxIter        = 50;
 static const int    updateInterval = 5;
 static const int    shrinkWarmup   = 5;
 static const double delta_safe     = 0.95;
 static const double gamma_smooth   = 0.8;
-static const int    Lmin_levels    = 6;     // FIX: must match server.cpp
+static const int    Lmin_levels    = 6;
 static const double B_mask         = 10.0;
 
-static const uint32_t MAGIC_READY       = 0xCAFEBABE;
-static const uint32_t MAGIC_REFRESH     = 0xABCD1234;
-static const uint32_t MAGIC_ITERDONE   = 0x00000001;
-static const uint32_t MAGIC_END         = 0xFFFFFFFF;
-static const uint32_t MAGIC_PLAIN_ADMM  = 0xAAAAAAAA;
-static const uint32_t MAGIC_TRIAD_START = 0xBBBBBBBB;
-static const uint32_t MAGIC_STATIC_R    = 0xCCCCCCCC;
-static const uint32_t MAGIC_ADAPTIVE    = 0xDDDDDDDD;
-static const uint32_t MAGIC_ALL_DONE    = 0xEEEEEEEE;
-static const uint32_t MAGIC_ABORT_SR    = 0xCC1EAF01;  // early-abort for Static-R experiment
-static const uint32_t MAGIC_CONTINUE_ITER = 0x00000003; // proceed with next iteration
+static const uint32_t MAGIC_READY          = 0xCAFEBABE;
+static const uint32_t MAGIC_REFRESH        = 0xABCD1234;
+static const uint32_t MAGIC_ITERDONE       = 0x00000001;
+static const uint32_t MAGIC_END            = 0xFFFFFFFF;
+static const uint32_t MAGIC_PLAIN_ADMM     = 0xAAAAAAAA;
+static const uint32_t MAGIC_TRIAD_START    = 0xBBBBBBBB;
+static const uint32_t MAGIC_STATIC_R       = 0xCCCCCCCC;
+static const uint32_t MAGIC_ADAPTIVE       = 0xDDDDDDDD;
+static const uint32_t MAGIC_ALL_DONE       = 0xEEEEEEEE;
+static const uint32_t MAGIC_ABORT_SR       = 0xCC1EAF01;
+static const uint32_t MAGIC_CONTINUE_ITER  = 0x00000003;
+static const uint32_t MAGIC_DO_MONITOR     = 0x00000004;
+static const uint32_t MAGIC_SKIP_MONITOR   = 0x00000005;
+static const uint32_t MAGIC_DO_U_DECRYPT   = 0x00000006;  // NEW
+static const uint32_t MAGIC_SKIP_U_DECRYPT = 0x00000007;  // NEW
 
 // ============================================================================
 // Network helpers
@@ -332,17 +339,12 @@ int main(int argc, char* argv[]) {
             cout << "  [PlainADMM] iter=" << setw(2) << iter
                  << "  t=" << fixed << setprecision(1) << elapsed() << "s" << endl;
             cout.flush();
-            // Receive v_i = z - u_i from server
             auto vi_plain = recvVec(fd);
-            // x-update: x_i = M_i * (g_i + rho * v_i)
             auto xi_plain = matvec(Mi, vecadd(gi, vecscale(vi_plain, rho)));
-            // Send x_i back to server
             sendVec(fd, xi_plain);
         }
 
-        // -----------------------------------------------------------------------
-        // Static-R experiments: handle any MAGIC_STATIC_R before MAGIC_TRIAD_START
-        // -----------------------------------------------------------------------
+        // Static-R / TRIAD_START dispatch
         while (true) {
             sig = recvU32(fd);
             if (sig == MAGIC_TRIAD_START) {
@@ -352,34 +354,22 @@ int main(int argc, char* argv[]) {
             if (sig != MAGIC_STATIC_R)
                 throw runtime_error("Expected MAGIC_STATIC_R or MAGIC_TRIAD_START");
 
+            // Static-R is disabled server-side (loop body skipped via continue),
+            // but we keep the client handler here for protocol compatibility.
             double fixedR = recvD(fd);
             cout << "\n===== StaticR=" << fixed << setprecision(1) << fixedR
-                 << " =====" << endl;
+                 << " (disabled — draining protocol) =====" << endl;
 
-            // Init state — no Bootstrap R, use fixedR directly
             vector<double> uiS(N_FEAT, 0.0);
             auto encUiS = cc->Encrypt(jointPK,
                               cc->MakeCKKSPackedPlaintext(vector<double>(N_FEAT, 0.0)));
             Ciphertext<DCRTPoly> encXiS = cc->Encrypt(jointPK,
                               cc->MakeCKKSPackedPlaintext(vector<double>(N_FEAT, 0.0)));
 
-            // ADMM iterations — same as TRIAD Phase 2 but WITHOUT CRC (step e)
             for (int iter = 0; iter < maxIter; iter++) {
-                // Pre-iteration handshake: server signals abort or continue
                 uint32_t iterCtrl = recvU32(fd);
-                if (iterCtrl == MAGIC_ABORT_SR) {
-                    cout << "  [ABORT_SR] server aborted StaticR="
-                         << fixed << setprecision(1) << fixedR
-                         << " — proceeding to final decrypt" << endl;
-                    break;
-                }
-                // else MAGIC_CONTINUE_ITER — proceed normally
+                if (iterCtrl == MAGIC_ABORT_SR) break;
 
-                cout << "  iter=" << setw(2) << iter
-                     << "  t=" << fixed << setprecision(1) << elapsed() << "s" << endl;
-                cout.flush();
-
-                // a) Send fresh masks
                 vector<double> rvS(N_FEAT), ruS(N_FEAT);
                 for (auto& v : rvS) v = maskDist(rng);
                 for (auto& v : ruS) v = maskDist(rng);
@@ -388,7 +378,6 @@ int main(int argc, char* argv[]) {
                 sendObj(fd, encRvS, cc);
                 sendObj(fd, encRuS, cc);
 
-                // b) Phase A: participate in ALL v masked-decrypts
                 vector<double> viS(N_FEAT, 0.0);
                 for (int j = 0; j < NUM_PARTIES; j++) {
                     auto encVjM = recvObj<Ciphertext<DCRTPoly>>(fd, cc);
@@ -402,12 +391,10 @@ int main(int argc, char* argv[]) {
                     }
                 }
 
-                // c) x-update
                 auto xiS = matvec(Mi, vecadd(gi, vecscale(viS, rho)));
                 encXiS = cc->Encrypt(jointPK, cc->MakeCKKSPackedPlaintext(xiS));
                 sendObj(fd, encXiS, cc);
 
-                // d) Phase C: participate in ALL u masked-decrypts
                 for (int j = 0; j < NUM_PARTIES; j++) {
                     auto encUjM = recvObj<Ciphertext<DCRTPoly>>(fd, cc);
                     Ciphertext<DCRTPoly> partU;
@@ -420,16 +407,10 @@ int main(int argc, char* argv[]) {
                     }
                 }
 
-                // e) [NO CRC for Static-R]
-
-                // f) Receive enc(z)
                 auto encZnewS = recvObj<Ciphertext<DCRTPoly>>(fd, cc);
-
-                // g) u-update
                 encUiS = cc->EvalAdd(encUiS, cc->EvalSub(encXiS, encZnewS));
                 sendObj(fd, encUiS, cc);
 
-                // h) MAGIC_REFRESH or MAGIC_ITERDONE
                 uint32_t flagS = recvU32(fd);
                 if (flagS == MAGIC_REFRESH) {
                     auto encZrefS = recvObj<Ciphertext<DCRTPoly>>(fd, cc);
@@ -443,7 +424,6 @@ int main(int argc, char* argv[]) {
                     sendObj(fd, encUiS, cc);
                 }
 
-                // i) Side-decrypt for objective monitoring
                 {
                     auto encZobjS = recvObj<Ciphertext<DCRTPoly>>(fd, cc);
                     Ciphertext<DCRTPoly> partObjS;
@@ -451,7 +431,6 @@ int main(int argc, char* argv[]) {
                     else           partObjS = cc->MultipartyDecryptMain({encZobjS}, mySK)[0];
                     sendObj(fd, partObjS, cc);
                 }
-                // i2) Send mem_used_MB
                 {
                     double mem_used = 0.0;
 #if defined(__linux__)
@@ -469,7 +448,6 @@ int main(int argc, char* argv[]) {
                 }
             }
 
-            // Final decrypt for this static-R run
             if (recvU32(fd) != MAGIC_END)
                 throw runtime_error("Expected MAGIC_END after static-R");
             auto encZfinalS = recvObj<Ciphertext<DCRTPoly>>(fd, cc);
@@ -478,15 +456,10 @@ int main(int argc, char* argv[]) {
             else           partFinalS = cc->MultipartyDecryptMain({encZfinalS}, mySK)[0];
             sendObj(fd, partFinalS, cc);
             auto zFinalS = recvVec(fd); zFinalS.resize(N_FEAT);
-            cout << "StaticR=" << fixedR << " done. z[0..4]:";
-            for (int i = 0; i < 5; i++)
-                cout << " " << fixed << setprecision(4) << zFinalS[i];
-            cout << "\nt=" << elapsed() << "s" << endl;
-        }  // end static-R loop
+        }
     }
-    } // end if (!triadOnly) — PlainADMM+StaticR
+    } // end if (!triadOnly)
     else {
-        // triad-only mode: receive MAGIC_TRIAD_START directly
         uint32_t sig = recvU32(fd);
         if (sig != MAGIC_TRIAD_START)
             throw runtime_error("Expected MAGIC_TRIAD_START in triad-only mode");
@@ -510,6 +483,8 @@ int main(int argc, char* argv[]) {
     double currentR = recvD(fd);
     cout << "  R^(0)=" << currentR << " (t=" << elapsed() << "s)" << endl;
 
+    // ui: plaintext dual variable — only updated when server sends MAGIC_DO_U_DECRYPT.
+    // Starts at zero, which is correct since encUi is also initialised to zero.
     vector<double> ui(N_FEAT, 0.0);
     auto encUi = cc->Encrypt(jointPK, cc->MakeCKKSPackedPlaintext(vector<double>(N_FEAT, 0.0)));
     Ciphertext<DCRTPoly> encXi_curr = encXi;
@@ -519,12 +494,31 @@ int main(int argc, char* argv[]) {
     // -----------------------------------------------------------------------
     cout << "\n[Phase 2] ADMM iterations..." << endl;
 
+    // For per-iter network throughput: track cumulative bytes and time
+    long long prev_net_bytes = 0;
+    double    prev_iter_t    = elapsed();
+#if defined(__linux__)
+    {   // initialise prev_net_bytes before loop
+        ifstream f("/proc/net/dev"); string line;
+        getline(f,line); getline(f,line);
+        while(getline(f,line)) {
+            string iface; istringstream ss(line);
+            ss>>iface; if(iface=="lo:") continue;
+            long long rx=0,tx=0,tmp;
+            ss>>rx>>tmp>>tmp>>tmp>>tmp>>tmp>>tmp>>tmp>>tx;
+            prev_net_bytes += rx+tx;
+        }
+    }
+#endif
+
     for (int iter = 0; iter < maxIter; iter++) {
         cout << "  iter=" << setw(2) << iter
              << "  t=" << fixed << setprecision(1) << elapsed() << "s" << endl;
         cout.flush();
 
-        // a) Send fresh masks enc(r_v), enc(r_u)
+        // a) Send fresh masks enc(r_v) and enc(r_u).
+        //    enc(r_u) is always sent so the server can use it immediately
+        //    if it decides to do u-decrypt this iteration.
         vector<double> rv(N_FEAT), ru(N_FEAT);
         for (auto& v : rv) v = maskDist(rng);
         for (auto& v : ru) v = maskDist(rng);
@@ -535,7 +529,6 @@ int main(int argc, char* argv[]) {
         cout << "    [a] masks sent" << endl; cout.flush();
 
         // b) Phase A: participate in ALL v masked-decrypts (j=0..K-1)
-        //    For j==myId: also receive plaintext(v_i + r_v), recover v_i
         vector<double> vi(N_FEAT, 0.0);
         for (int j = 0; j < NUM_PARTIES; j++) {
             auto encVjMasked = recvObj<Ciphertext<DCRTPoly>>(fd, cc);
@@ -556,18 +549,28 @@ int main(int argc, char* argv[]) {
         sendObj(fd, encXi_curr, cc);
         cout << "    [c] enc(x_i) sent" << endl; cout.flush();
 
-        // d) Phase C: participate in ALL u masked-decrypts (j=0..K-1)
-        for (int j = 0; j < NUM_PARTIES; j++) {
-            auto encUjMasked = recvObj<Ciphertext<DCRTPoly>>(fd, cc);
-            Ciphertext<DCRTPoly> partU;
-            if (myId == 0) partU = cc->MultipartyDecryptLead({encUjMasked}, mySK)[0];
-            else           partU = cc->MultipartyDecryptMain({encUjMasked}, mySK)[0];
-            sendObj(fd, partU, cc);
-            if (j == myId) {
-                auto uiMasked = recvVec(fd);
-                for (size_t k = 0; k < N_FEAT; k++) ui[k] = uiMasked[k] - ru[k];
-                cout << "    [d] u_i recovered (j=" << j << ")" << endl; cout.flush();
+        // d) LAZY u-decrypt: server decides whether to fire this iteration.
+        //    If MAGIC_DO_U_DECRYPT: participate in masked-decrypt and update ui.
+        //    If MAGIC_SKIP_U_DECRYPT: do nothing — ui plaintext stays stale but
+        //    that is fine because Refresh hasn't happened yet.
+        {
+            uint32_t uCtrl = recvU32(fd);
+            if (uCtrl == MAGIC_DO_U_DECRYPT) {
+                for (int j = 0; j < NUM_PARTIES; j++) {
+                    auto encUjMasked = recvObj<Ciphertext<DCRTPoly>>(fd, cc);
+                    Ciphertext<DCRTPoly> partU;
+                    if (myId == 0) partU = cc->MultipartyDecryptLead({encUjMasked}, mySK)[0];
+                    else           partU = cc->MultipartyDecryptMain({encUjMasked}, mySK)[0];
+                    sendObj(fd, partU, cc);
+                    if (j == myId) {
+                        auto uiMasked = recvVec(fd);
+                        for (size_t k = 0; k < N_FEAT; k++) ui[k] = uiMasked[k] - ru[k];
+                        cout << "    [d] u_i recovered (lazy, j=" << j << ")" << endl;
+                        cout.flush();
+                    }
+                }
             }
+            // MAGIC_SKIP_U_DECRYPT: enc(r_u) we sent in step (a) is discarded by server.
         }
 
         // e) CRC safety check (if triggered this iter)
@@ -581,9 +584,8 @@ int main(int argc, char* argv[]) {
             auto wi = vecadd(xi, ui);
             double maxW = 0;
             for (auto v : wi) maxW = max(maxW, abs(v));
-            bool safe = (maxW <= delta_safe * currentR);  // 用currentR而不是R_raw
+            bool safe = (maxW <= delta_safe * currentR);
             sendBool(fd, safe);
-            // 同步更新currentR，与server保持一致
             double oldR = currentR;
             if (R_raw > currentR) {
                 currentR = R_raw;
@@ -609,37 +611,41 @@ int main(int argc, char* argv[]) {
         uint32_t flag = recvU32(fd);
         if (flag == MAGIC_REFRESH) {
             cout << "    [h] REFRESH" << endl; cout.flush();
+            // ui plaintext is guaranteed fresh because server sent MAGIC_DO_U_DECRYPT
+            // in step (d) of this iteration (or REFRESH_LOOKAHEAD iters ago).
             auto encZref = recvObj<Ciphertext<DCRTPoly>>(fd, cc);
             Ciphertext<DCRTPoly> partZ;
             if (myId == 0) partZ = cc->MultipartyDecryptLead({encZref}, mySK)[0];
             else           partZ = cc->MultipartyDecryptMain({encZref}, mySK)[0];
             sendObj(fd, partZ, cc);
-            // receive fresh enc(z) — server manages it, we just discard
             auto encZfresh = recvObj<Ciphertext<DCRTPoly>>(fd, cc);
             (void)encZfresh;
-            // re-encrypt enc(u_i) from plaintext ui (restores level)
+            // Re-encrypt enc(u_i) from plaintext ui (restores level to maximum)
             encUi = cc->Encrypt(jointPK, cc->MakeCKKSPackedPlaintext(ui));
             sendObj(fd, encUi, cc);
             cout << "    [h] Refresh done" << endl;
         }
         // MAGIC_ITERDONE: nothing to do
 
-        // i) Side-decrypt for server's objective monitoring (step j in server)
+        // i) Side-decrypt for server's objective monitoring (sparse)
         {
-            auto encZobj = recvObj<Ciphertext<DCRTPoly>>(fd, cc);
-            Ciphertext<DCRTPoly> partObj;
-            if (myId == 0) partObj = cc->MultipartyDecryptLead({encZobj}, mySK)[0];
-            else           partObj = cc->MultipartyDecryptMain({encZobj}, mySK)[0];
-            sendObj(fd, partObj, cc);
+            uint32_t monFlag = recvU32(fd);
+            if (monFlag == MAGIC_DO_MONITOR) {
+                auto encZobj = recvObj<Ciphertext<DCRTPoly>>(fd, cc);
+                Ciphertext<DCRTPoly> partObj;
+                if (myId == 0) partObj = cc->MultipartyDecryptLead({encZobj}, mySK)[0];
+                else           partObj = cc->MultipartyDecryptMain({encZobj}, mySK)[0];
+                sendObj(fd, partObj, cc);
+            }
+            // MAGIC_SKIP_MONITOR: nothing to do
         }
+
         // i2) Send system metrics: cpu_temp_C, mem_used_MB, net_bytes, cpu_freq_MHz
         {
-            // CPU temperature
             double cpu_temp = 0.0;
 #if defined(__linux__)
             { ifstream f("/sys/class/thermal/thermal_zone0/temp"); int t=0; if(f>>t) cpu_temp=t/1000.0; }
 #endif
-            // Memory used (MB)
             double mem_used = 0.0;
 #if defined(__linux__)
             {
@@ -652,29 +658,35 @@ int main(int argc, char* argv[]) {
                 mem_used = (total-avail)/1024.0;
             }
 #endif
-            // Network bytes (RX+TX on all interfaces except lo)
-            double net_bytes = 0.0;
+            // Network throughput (MB/s) since last iter
+            double net_MBps = 0.0;
 #if defined(__linux__)
             {
+                long long cur_bytes = 0;
                 ifstream f("/proc/net/dev"); string line;
-                getline(f,line); getline(f,line); // skip 2 header lines
+                getline(f,line); getline(f,line);
                 while(getline(f,line)) {
                     string iface; istringstream ss(line);
                     ss>>iface; if(iface=="lo:") continue;
                     long long rx=0,tx=0,tmp;
                     ss>>rx>>tmp>>tmp>>tmp>>tmp>>tmp>>tmp>>tmp>>tx;
-                    net_bytes += rx+tx;
+                    cur_bytes += rx+tx;
                 }
+                double cur_t  = elapsed();
+                double dt_s   = cur_t - prev_iter_t;
+                if (dt_s > 0.0)
+                    net_MBps = (cur_bytes - prev_net_bytes) / 1e6 / dt_s;
+                prev_net_bytes = cur_bytes;
+                prev_iter_t    = cur_t;
             }
 #endif
-            // CPU frequency (MHz)
             double cpu_freq = 0.0;
 #if defined(__linux__)
             { ifstream f("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq"); long hz=0; if(f>>hz) cpu_freq=hz/1000.0; }
 #endif
             sendD(fd, cpu_temp);
             sendD(fd, mem_used);
-            sendD(fd, net_bytes);
+            sendD(fd, net_MBps);
             sendD(fd, cpu_freq);
         }
 
