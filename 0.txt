@@ -1,0 +1,535 @@
+huang@raspberrypi2:~ $ cd ~/triad && ./build/client 0
+=== TRIAD Client 0 ===
+  lambda=0.1 Lmin=6
+
+[Init] Loading keys...
+  CryptoContext loaded (t=0.0920318s)
+  sk_0 loaded (t=0.155169s)
+
+[Net] Listening on port 10000...
+  Server connected (t=22.5338s)
+
+[Precompute] M_i and g_i...
+  Done (t=22.5529s)
+
+[PlainADMM] Starting plaintext ADMM loop...
+  [PlainADMM] iter= 0  t=23.0s
+  [PlainADMM] iter= 1  t=23.0s
+  [PlainADMM] iter= 2  t=23.1s
+  [PlainADMM] iter= 3  t=23.1s
+  [PlainADMM] iter= 4  t=23.1s
+  [PlainADMM] iter= 5  t=23.2s
+  [PlainADMM] iter= 6  t=23.3s
+  [PlainADMM] iter= 7  t=23.3s
+  [PlainADMM] iter= 8  t=23.3s
+  [PlainADMM] iter= 9  t=23.3s
+  [PlainADMM] iter=10  t=23.4s
+  [PlainADMM] iter=11  t=23.4s
+  [PlainADMM] iter=12  t=23.4s
+  [PlainADMM] iter=13  t=23.4s
+  [PlainADMM] iter=14  t=23.5s
+  [PlainADMM] iter=15  t=23.5s
+  [PlainADMM] iter=16  t=23.5s
+  [PlainADMM] iter=17  t=23.6s
+  [PlainADMM] iter=18  t=23.6s
+  [PlainADMM] iter=19  t=23.7s
+  [PlainADMM] iter=20  t=23.7s
+  [PlainADMM] iter=21  t=23.8s
+  [PlainADMM] iter=22  t=23.8s
+  [PlainADMM] iter=23  t=23.8s
+  [PlainADMM] iter=24  t=23.8s
+  [PlainADMM] iter=25  t=23.8s
+  [PlainADMM] iter=26  t=23.9s
+  [PlainADMM] iter=27  t=23.9s
+  [PlainADMM] iter=28  t=23.9s
+  [PlainADMM] iter=29  t=23.9s
+  [PlainADMM] iter=30  t=23.9s
+  [PlainADMM] iter=31  t=24.0s
+  [PlainADMM] iter=32  t=24.0s
+  [PlainADMM] iter=33  t=24.0s
+  [PlainADMM] iter=34  t=24.0s
+  [PlainADMM] iter=35  t=24.0s
+  [PlainADMM] iter=36  t=24.0s
+  [PlainADMM] iter=37  t=24.1s
+  [PlainADMM] iter=38  t=24.1s
+  [PlainADMM] iter=39  t=24.1s
+  [PlainADMM] iter=40  t=24.1s
+  [PlainADMM] iter=41  t=24.1s
+  [PlainADMM] iter=42  t=24.1s
+  [PlainADMM] iter=43  t=24.2s
+  [PlainADMM] iter=44  t=24.2s
+  [PlainADMM] iter=45  t=24.2s
+  [PlainADMM] iter=46  t=24.2s
+  [PlainADMM] iter=47  t=24.2s
+  [PlainADMM] iter=48  t=24.3s
+  [PlainADMM] iter=49  t=24.3s
+[PlainADMM] Done. Proceeding to TRIAD...
+
+[Phase 1] Bootstrap R...
+  R^(0)=1.5 (t=44.0s)
+
+[Phase 2] ADMM iterations...
+  iter= 0  t=44.1s
+    [a] masks sent
+    [b] v_i recovered (j=0)
+    [c] enc(x_i) sent
+    [d] u_i recovered (lazy, j=0)
+    [f] enc(z) received
+    [g] enc(u_i) sent
+    [iter 0 done] t=190.9s
+  iter= 1  t=190.9s
+    [a] masks sent
+    [b] v_i recovered (j=0)
+    [c] enc(x_i) sent
+    [d] u_i recovered (lazy, j=0)
+    [f] enc(z) received
+    [g] enc(u_i) sent
+    [h] REFRESH
+    [h] Refresh done
+    [iter 1 done] t=365.2s
+  iter= 2  t=365.2s
+    [a] masks sent
+    [b] v_i recovered (j=0)
+    [c] enc(x_i) sent
+    [d] u_i recovered (lazy, j=0)
+    [f] enc(z) received
+    [g] enc(u_i) sent
+    [iter 2 done] t=541.1s
+  iter= 3  t=541.1s
+    [a] masks sent
+    [b] v_i recovered (j=0)
+    [c] enc(x_i) sent
+    [d] u_i recovered (lazy, j=0)
+    [f] enc(z) received
+    [g] enc(u_i) sent
+    [h] REFRESH
+    [h] Refresh done
+    [iter 3 done] t=705.0s
+  iter= 4  t=705.0s
+    [a] masks sent
+    [b] v_i recovered (j=0)
+    [c] enc(x_i) sent
+    [d] u_i recovered (lazy, j=0)
+    [f] enc(z) received
+    [g] enc(u_i) sent
+    [iter 4 done] t=892.1s
+  iter= 5  t=892.1s
+    [a] masks sent
+    [b] v_i recovered (j=0)
+    [c] enc(x_i) sent
+    [d] u_i recovered (lazy, j=0)
+    [e] CRC R_raw=0.3 R: 1.5 -> 1.5
+    [f] enc(z) received
+    [g] enc(u_i) sent
+    [h] REFRESH
+    [h] Refresh done
+    [iter 5 done] t=1107.7s
+  iter= 6  t=1107.7s
+    [a] masks sent
+    [b] v_i recovered (j=0)
+    [c] enc(x_i) sent
+    [d] u_i recovered (lazy, j=0)
+    [f] enc(z) received
+    [g] enc(u_i) sent
+    [iter 6 done] t=1318.4s
+  iter= 7  t=1318.4s
+    [a] masks sent
+    [b] v_i recovered (j=0)
+    [c] enc(x_i) sent
+    [d] u_i recovered (lazy, j=0)
+    [f] enc(z) received
+    [g] enc(u_i) sent
+    [h] REFRESH
+    [h] Refresh done
+    [iter 7 done] t=1508.1s
+  iter= 8  t=1508.1s
+    [a] masks sent
+    [b] v_i recovered (j=0)
+    [c] enc(x_i) sent
+    [d] u_i recovered (lazy, j=0)
+    [f] enc(z) received
+    [g] enc(u_i) sent
+    [iter 8 done] t=1791.5s
+  iter= 9  t=1791.5s
+    [a] masks sent
+    [b] v_i recovered (j=0)
+    [c] enc(x_i) sent
+    [d] u_i recovered (lazy, j=0)
+    [f] enc(z) received
+    [g] enc(u_i) sent
+    [h] REFRESH
+    [h] Refresh done
+    [iter 9 done] t=1924.0s
+  iter=10  t=1924.0s
+    [a] masks sent
+    [b] v_i recovered (j=0)
+    [c] enc(x_i) sent
+    [d] u_i recovered (lazy, j=0)
+    [e] CRC R_raw=0.4 R: 1.5 -> 1.6
+    [f] enc(z) received
+    [g] enc(u_i) sent
+    [iter 10 done] t=2086.1s
+  iter=11  t=2086.1s
+    [a] masks sent
+    [b] v_i recovered (j=0)
+    [c] enc(x_i) sent
+    [d] u_i recovered (lazy, j=0)
+    [f] enc(z) received
+    [g] enc(u_i) sent
+    [h] REFRESH
+    [h] Refresh done
+    [iter 11 done] t=2190.5s
+  iter=12  t=2190.5s
+    [a] masks sent
+    [b] v_i recovered (j=0)
+    [c] enc(x_i) sent
+    [d] u_i recovered (lazy, j=0)
+    [f] enc(z) received
+    [g] enc(u_i) sent
+    [iter 12 done] t=2342.0s
+  iter=13  t=2342.0s
+    [a] masks sent
+    [b] v_i recovered (j=0)
+    [c] enc(x_i) sent
+    [d] u_i recovered (lazy, j=0)
+    [f] enc(z) received
+    [g] enc(u_i) sent
+    [h] REFRESH
+    [h] Refresh done
+    [iter 13 done] t=2465.4s
+  iter=14  t=2465.4s
+    [a] masks sent
+    [b] v_i recovered (j=0)
+    [c] enc(x_i) sent
+    [d] u_i recovered (lazy, j=0)
+    [f] enc(z) received
+    [g] enc(u_i) sent
+    [iter 14 done] t=2748.3s
+  iter=15  t=2748.3s
+    [a] masks sent
+    [b] v_i recovered (j=0)
+    [c] enc(x_i) sent
+    [d] u_i recovered (lazy, j=0)
+    [e] CRC R_raw=0.4 R: 1.6 -> 1.7
+    [f] enc(z) received
+    [g] enc(u_i) sent
+    [h] REFRESH
+    [h] Refresh done
+    [iter 15 done] t=2858.7s
+  iter=16  t=2858.7s
+    [a] masks sent
+    [b] v_i recovered (j=0)
+    [c] enc(x_i) sent
+    [d] u_i recovered (lazy, j=0)
+    [f] enc(z) received
+    [g] enc(u_i) sent
+    [iter 16 done] t=2959.7s
+  iter=17  t=2959.7s
+    [a] masks sent
+    [b] v_i recovered (j=0)
+    [c] enc(x_i) sent
+    [d] u_i recovered (lazy, j=0)
+    [f] enc(z) received
+    [g] enc(u_i) sent
+    [h] REFRESH
+    [h] Refresh done
+    [iter 17 done] t=3054.7s
+  iter=18  t=3054.7s
+    [a] masks sent
+    [b] v_i recovered (j=0)
+    [c] enc(x_i) sent
+    [d] u_i recovered (lazy, j=0)
+    [f] enc(z) received
+    [g] enc(u_i) sent
+    [iter 18 done] t=3156.4s
+  iter=19  t=3156.4s
+    [a] masks sent
+    [b] v_i recovered (j=0)
+    [c] enc(x_i) sent
+    [d] u_i recovered (lazy, j=0)
+    [f] enc(z) received
+    [g] enc(u_i) sent
+    [h] REFRESH
+    [h] Refresh done
+    [iter 19 done] t=3247.1s
+  iter=20  t=3247.1s
+    [a] masks sent
+    [b] v_i recovered (j=0)
+    [c] enc(x_i) sent
+    [d] u_i recovered (lazy, j=0)
+    [e] CRC R_raw=0.4 R: 1.7 -> 1.3
+    [f] enc(z) received
+    [g] enc(u_i) sent
+    [iter 20 done] t=3379.9s
+  iter=21  t=3379.9s
+    [a] masks sent
+    [b] v_i recovered (j=0)
+    [c] enc(x_i) sent
+    [d] u_i recovered (lazy, j=0)
+    [f] enc(z) received
+    [g] enc(u_i) sent
+    [h] REFRESH
+    [h] Refresh done
+    [iter 21 done] t=3476.4s
+  iter=22  t=3476.4s
+    [a] masks sent
+    [b] v_i recovered (j=0)
+    [c] enc(x_i) sent
+    [d] u_i recovered (lazy, j=0)
+    [f] enc(z) received
+    [g] enc(u_i) sent
+    [iter 22 done] t=3558.8s
+  iter=23  t=3558.8s
+    [a] masks sent
+    [b] v_i recovered (j=0)
+    [c] enc(x_i) sent
+    [d] u_i recovered (lazy, j=0)
+    [f] enc(z) received
+    [g] enc(u_i) sent
+    [h] REFRESH
+    [h] Refresh done
+    [iter 23 done] t=3646.0s
+  iter=24  t=3646.0s
+    [a] masks sent
+    [b] v_i recovered (j=0)
+    [c] enc(x_i) sent
+    [d] u_i recovered (lazy, j=0)
+    [f] enc(z) received
+    [g] enc(u_i) sent
+    [iter 24 done] t=3732.2s
+  iter=25  t=3732.2s
+    [a] masks sent
+    [b] v_i recovered (j=0)
+    [c] enc(x_i) sent
+    [d] u_i recovered (lazy, j=0)
+    [e] CRC R_raw=0.4 R: 1.3 -> 1.4
+    [f] enc(z) received
+    [g] enc(u_i) sent
+    [h] REFRESH
+    [h] Refresh done
+    [iter 25 done] t=3821.3s
+  iter=26  t=3821.3s
+    [a] masks sent
+    [b] v_i recovered (j=0)
+    [c] enc(x_i) sent
+    [d] u_i recovered (lazy, j=0)
+    [f] enc(z) received
+    [g] enc(u_i) sent
+    [iter 26 done] t=3901.1s
+  iter=27  t=3901.1s
+    [a] masks sent
+    [b] v_i recovered (j=0)
+    [c] enc(x_i) sent
+    [d] u_i recovered (lazy, j=0)
+    [f] enc(z) received
+    [g] enc(u_i) sent
+    [h] REFRESH
+    [h] Refresh done
+    [iter 27 done] t=4007.9s
+  iter=28  t=4007.9s
+    [a] masks sent
+    [b] v_i recovered (j=0)
+    [c] enc(x_i) sent
+    [d] u_i recovered (lazy, j=0)
+    [f] enc(z) received
+    [g] enc(u_i) sent
+    [iter 28 done] t=4118.1s
+  iter=29  t=4118.1s
+    [a] masks sent
+    [b] v_i recovered (j=0)
+    [c] enc(x_i) sent
+    [d] u_i recovered (lazy, j=0)
+    [f] enc(z) received
+    [g] enc(u_i) sent
+    [h] REFRESH
+    [h] Refresh done
+    [iter 29 done] t=4215.5s
+  iter=30  t=4215.5s
+    [a] masks sent
+    [b] v_i recovered (j=0)
+    [c] enc(x_i) sent
+    [d] u_i recovered (lazy, j=0)
+    [e] CRC R_raw=0.4 R: 1.4 -> 1.5
+    [f] enc(z) received
+    [g] enc(u_i) sent
+    [iter 30 done] t=4349.1s
+  iter=31  t=4349.1s
+    [a] masks sent
+    [b] v_i recovered (j=0)
+    [c] enc(x_i) sent
+    [d] u_i recovered (lazy, j=0)
+    [f] enc(z) received
+    [g] enc(u_i) sent
+    [h] REFRESH
+    [h] Refresh done
+    [iter 31 done] t=4488.6s
+  iter=32  t=4488.6s
+    [a] masks sent
+    [b] v_i recovered (j=0)
+    [c] enc(x_i) sent
+    [d] u_i recovered (lazy, j=0)
+    [f] enc(z) received
+    [g] enc(u_i) sent
+    [iter 32 done] t=4645.1s
+  iter=33  t=4645.1s
+    [a] masks sent
+    [b] v_i recovered (j=0)
+    [c] enc(x_i) sent
+    [d] u_i recovered (lazy, j=0)
+    [f] enc(z) received
+    [g] enc(u_i) sent
+    [h] REFRESH
+    [h] Refresh done
+    [iter 33 done] t=4798.0s
+  iter=34  t=4798.0s
+    [a] masks sent
+    [b] v_i recovered (j=0)
+    [c] enc(x_i) sent
+    [d] u_i recovered (lazy, j=0)
+    [f] enc(z) received
+    [g] enc(u_i) sent
+    [iter 34 done] t=4980.2s
+  iter=35  t=4980.2s
+    [a] masks sent
+    [b] v_i recovered (j=0)
+    [c] enc(x_i) sent
+    [d] u_i recovered (lazy, j=0)
+    [e] CRC R_raw=0.4 R: 1.5 -> 1.6
+    [f] enc(z) received
+    [g] enc(u_i) sent
+    [h] REFRESH
+    [h] Refresh done
+    [iter 35 done] t=5132.3s
+  iter=36  t=5132.3s
+    [a] masks sent
+    [b] v_i recovered (j=0)
+    [c] enc(x_i) sent
+    [d] u_i recovered (lazy, j=0)
+    [f] enc(z) received
+    [g] enc(u_i) sent
+    [iter 36 done] t=5316.5s
+  iter=37  t=5316.5s
+    [a] masks sent
+    [b] v_i recovered (j=0)
+    [c] enc(x_i) sent
+    [d] u_i recovered (lazy, j=0)
+    [f] enc(z) received
+    [g] enc(u_i) sent
+    [h] REFRESH
+    [h] Refresh done
+    [iter 37 done] t=5479.8s
+  iter=38  t=5479.8s
+    [a] masks sent
+    [b] v_i recovered (j=0)
+    [c] enc(x_i) sent
+    [d] u_i recovered (lazy, j=0)
+    [f] enc(z) received
+    [g] enc(u_i) sent
+    [iter 38 done] t=5616.0s
+  iter=39  t=5616.0s
+    [a] masks sent
+    [b] v_i recovered (j=0)
+    [c] enc(x_i) sent
+    [d] u_i recovered (lazy, j=0)
+    [f] enc(z) received
+    [g] enc(u_i) sent
+    [h] REFRESH
+    [h] Refresh done
+    [iter 39 done] t=5753.3s
+  iter=40  t=5753.3s
+    [a] masks sent
+    [b] v_i recovered (j=0)
+    [c] enc(x_i) sent
+    [d] u_i recovered (lazy, j=0)
+    [e] CRC R_raw=0.4 R: 1.6 -> 1.6
+    [f] enc(z) received
+    [g] enc(u_i) sent
+    [iter 40 done] t=5918.0s
+  iter=41  t=5918.0s
+    [a] masks sent
+    [b] v_i recovered (j=0)
+    [c] enc(x_i) sent
+    [d] u_i recovered (lazy, j=0)
+    [f] enc(z) received
+    [g] enc(u_i) sent
+    [h] REFRESH
+    [h] Refresh done
+    [iter 41 done] t=6054.3s
+  iter=42  t=6054.3s
+    [a] masks sent
+    [b] v_i recovered (j=0)
+    [c] enc(x_i) sent
+    [d] u_i recovered (lazy, j=0)
+    [f] enc(z) received
+    [g] enc(u_i) sent
+    [iter 42 done] t=6193.0s
+  iter=43  t=6193.0s
+    [a] masks sent
+    [b] v_i recovered (j=0)
+    [c] enc(x_i) sent
+    [d] u_i recovered (lazy, j=0)
+    [f] enc(z) received
+    [g] enc(u_i) sent
+    [h] REFRESH
+    [h] Refresh done
+    [iter 43 done] t=6317.5s
+  iter=44  t=6317.5s
+    [a] masks sent
+    [b] v_i recovered (j=0)
+    [c] enc(x_i) sent
+    [d] u_i recovered (lazy, j=0)
+    [f] enc(z) received
+    [g] enc(u_i) sent
+    [iter 44 done] t=6455.4s
+  iter=45  t=6455.4s
+    [a] masks sent
+    [b] v_i recovered (j=0)
+    [c] enc(x_i) sent
+    [d] u_i recovered (lazy, j=0)
+    [e] CRC R_raw=0.4 R: 1.6 -> 1.7
+    [f] enc(z) received
+    [g] enc(u_i) sent
+    [h] REFRESH
+    [h] Refresh done
+    [iter 45 done] t=6601.5s
+  iter=46  t=6601.5s
+    [a] masks sent
+    [b] v_i recovered (j=0)
+    [c] enc(x_i) sent
+    [d] u_i recovered (lazy, j=0)
+    [f] enc(z) received
+    [g] enc(u_i) sent
+    [iter 46 done] t=6739.3s
+  iter=47  t=6739.3s
+    [a] masks sent
+    [b] v_i recovered (j=0)
+    [c] enc(x_i) sent
+    [d] u_i recovered (lazy, j=0)
+    [f] enc(z) received
+    [g] enc(u_i) sent
+    [h] REFRESH
+    [h] Refresh done
+    [iter 47 done] t=6861.5s
+  iter=48  t=6861.5s
+    [a] masks sent
+    [b] v_i recovered (j=0)
+    [c] enc(x_i) sent
+    [d] u_i recovered (lazy, j=0)
+    [f] enc(z) received
+    [g] enc(u_i) sent
+    [iter 48 done] t=6992.8s
+  iter=49  t=6992.8s
+    [a] masks sent
+    [b] v_i recovered (j=0)
+    [c] enc(x_i) sent
+    [d] u_i recovered (lazy, j=0)
+    [f] enc(z) received
+    [g] enc(u_i) sent
+    [h] REFRESH
+    [h] Refresh done
+    [iter 49 done] t=7122.6s
+
+[Phase 3] Final decrypt...
+Final z[0..9]: 1.4727 -0.0542 -0.0477 -0.0208 -0.1446 -0.0195 0.0197 0.0271 -0.0019 -0.0393
+Total time: 7140.0281s
+Client 0 done.
